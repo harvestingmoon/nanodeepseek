@@ -1,7 +1,8 @@
 ### NanoGPT Incorporating DeepSeek Things
 
 
-This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers. It basically incorporates novel deepseek items into a small simple and concise LLM (that is basically NanoGPT)
+### Motivation:
+This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers. It basically incorporates novel deepseek techniques into a small simple and concise LLM (that is basically NanoGPT). It also allowsme to better understand the model lol
 
 
 Key items: 
