@@ -1,35 +1,39 @@
 ### NanoGPT Incorporating DeepSeek Things
 
+## TLDR: NanoGPT with DeepSeek 
 
 ### Motivation:
-This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers. It basically incorporates novel deepseek techniques into a small simple and concise LLM (that is basically NanoGPT). It also allowsme to better understand the model lol
+This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers into a small simple and concise LLM (that is basically NanoGPT). It also allows me to better understand models at a finegrained level.
 
 
-Key items: 
-1. Multi latent attention (v2)
-2. DeepSeekMoe (v2)
-3. Decoupled RoPe (v2)
-4. Multi Token Prediction (v3)
-5. GRPO ? (r1) <- I need to learn some RL stuff before I can train this model
+
+### Items Implemented: 
+- Multi Latent Attention (with K/V cache in place)
+- DeepSeekMoE (with fine grained expert segmentation, shared expert isolation and a modified auxillary load balacer)
+- Decoupled RoPE 
 
 
-TLDR: I took the Andrej Karpathy's nanoGPT model and modified it to include
+## Things I want to further implement:
+- Multi-Token Prediction
+- GRPO (r1)
+- FP8 Mixed Precision Training
+- 
 
 
-Current items in place:
+### Some Novel Statistics:
 
-1. Multi Latent Attention (with K/V cache in place)
-2. Mixture Of Experts (not DeepSeekMoe, will implement DeepSeekMoe w/o Auxillary Loss then do so later)
-3. Decoupled RoPE 
+This model has 194.8m parameters, with about 12 MoE Layers (since the transformer blocks are stacked on top of each other)
 
-Flash attention was already pre implemented via Torhc
+Each MoE layer has about 9.45m params with about 7.08 active params per layer (layer referencing to the transformer block again)
 
 
-So now this model has 62 million parameters with 8 experts, each expert has about 4.7 million params 
+### How To train: 
 
-I have not included a how to on training etc but it is trainable so I have provided the script, have fun I guess :)
+1. Fork Andrej Karpathy's NanoGPT repo
+2. Replace `train.py` and `model.py` with the files here 
+3. Perform the same training process as stated in the NanoGPT guide 
 
-Just download use the script together with the combined instructions from Andrej Karpathy and it wil be fine 
+
 
 #### DeepSeek Papers: 
 [Deepseek v2](https://arxiv.org/pdf/2405.04434)\

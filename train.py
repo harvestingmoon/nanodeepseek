@@ -7,17 +7,6 @@ $ python train.py --batch_size=32 --compile=False
 
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-
-python train.py config/train_shakespeare_char.py --batch_size=512 --compile=False
-
-
 """
 
 import os
@@ -59,10 +48,11 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
-# --- MODIFICATION: Add MoE model args to config ---
+# --- MODIFICATION: Updated for auxiliary-loss-free MoE model ---
 n_experts = 8
-n_experts_per_token = 2
-aux_loss_weight = 1e-4
+n_experts_per_token = 4
+n_shared_experts = 2
+bias_update_gamma = 1e-2
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -96,7 +86,7 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddrank == 0 # this process will do logging, checkpointing etc.
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
@@ -147,10 +137,11 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-# --- MODIFICATION: Add MoE args to the model_args dict ---
+# --- MODIFICATION: Updated model_args for the new MoE config ---
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  n_experts=n_experts, n_experts_per_token=n_experts_per_token, aux_loss_weight=aux_loss_weight)
+                  n_experts=n_experts, n_experts_per_token=n_experts_per_token,
+                  n_shared_experts=n_shared_experts, bias_update_gamma=bias_update_gamma)
 
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
@@ -164,13 +155,12 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # --- MODIFICATION: also load MoE args if they exist in checkpoint ---
-    for k in ['n_experts', 'n_experts_per_token', 'aux_loss_weight']:
+    # --- MODIFICATION: Load new MoE args from checkpoint if they exist ---
+    for k in ['n_experts', 'n_experts_per_token', 'n_shared_experts', 'bias_update_gamma']:
         if k in checkpoint_model_args:
-             model_args[k] = checkpoint_model_args[k]
+            model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
@@ -202,33 +192,26 @@ checkpoint = None
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model, backend="eager")
+    model = torch.compile(model) # Eager backend is default now
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# --- MODIFICATION: Updated estimate_loss to handle MoE loss tuple ---
+# --- MODIFICATION: Updated estimate_loss to handle single loss value ---
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        main_losses = torch.zeros(eval_iters)
-        aux_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss_tuple = model(X, Y)
-                # The returned loss is a tuple: (total_loss, main_loss, aux_loss)
-                losses[k] = loss_tuple[0].item()
-                main_losses[k] = loss_tuple[1].item()
-                aux_losses[k] = loss_tuple[2].item()
-        out[split] = {
-            'total': losses.mean(),
-            'main': main_losses.mean(),
-            'aux': aux_losses.mean()
-        }
+                # Model now returns (logits, loss), where loss is a single value or None
+                logits, loss = model(X, Y)
+            if loss is not None:
+                losses[k] = loss.item()
+        out[split] = losses.mean()
     model.train()
     return out
 
@@ -256,24 +239,20 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # --- MODIFICATION: Updated evaluation block to log detailed MoE losses ---
+    # --- MODIFICATION: Updated evaluation block for single loss value ---
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']['total']:.4f}, val loss {losses['val']['total']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/total_loss": losses['train']['total'],
-                "train/main_loss": losses['train']['main'],
-                "train/aux_loss": losses['train']['aux'],
-                "val/total_loss": losses['val']['total'],
-                "val/main_loss": losses['val']['main'],
-                "val/aux_loss": losses['val']['aux'],
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100,
             })
-        if losses['val']['total'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']['total']
+        if losses['val'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -288,24 +267,22 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # --- MODIFICATION: Updated training step to handle MoE loss tuple ---
-    # We accumulate the component losses for logging purposes
-    total_main_loss_acc = 0.0
-    total_aux_loss_acc = 0.0
+    # --- MODIFICATION: Track loss across micro-steps for logging ---
+    loss_acc = 0.0
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss_tuple = model(X, Y)
-            # Unpack the loss tuple and scale the total loss for gradient accumulation
-            loss = loss_tuple[0] / gradient_accumulation_steps
-            # Accumulate component losses for logging
-            total_main_loss_acc += loss_tuple[1].item() / gradient_accumulation_steps
-            total_aux_loss_acc += loss_tuple[2].item() / gradient_accumulation_steps
-
+            logits, loss = model(X, Y)
+            if loss is not None:
+                # scale the loss and accumulate for logging
+                scaled_loss = loss / gradient_accumulation_steps
+                loss_acc += scaled_loss.item()
+        
         X, Y = get_batch('train')
-        scaler.scale(loss).backward()
-
+        if loss is not None:
+            scaler.scale(scaled_loss).backward()
+    
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -316,13 +293,16 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    # --- MODIFICATION: Updated logging to show detailed MoE losses ---
+
+    # --- MODIFICATION: Use the accumulated loss for logging ---
     if iter_num % log_interval == 0 and master_process:
-        lossf = loss.item() * gradient_accumulation_steps
+        # lossf is now the accumulated loss over all micro-steps
+        lossf = loss_acc
         if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f} (main: {total_main_loss_acc:.4f}, aux: {total_aux_loss_acc:.4f}), time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
     iter_num += 1
     local_iter_num += 1
 

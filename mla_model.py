@@ -1,10 +1,6 @@
 """
 Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+Really it is a GPT Model but with DeepSeek modifications
 """
 
 import math
@@ -41,6 +37,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -155,13 +152,13 @@ class MLASelfAttention(nn.Module):
         k = self.k_up_proj(k_latent).transpose(1, 2)
         v = self.v_up_proj(v_latent).transpose(1, 2)
 
-        # --- Apply RoPE to Query and Key ---
+       
         cos, sin = self.rope_cache
         cos = cos.to(q.device)
         sin = sin.to(q.device)
         q = self.apply_rope(q, cos, sin)
         k = self.apply_rope(k, cos, sin)
-        # --- End RoPE application ---
+       
 
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
@@ -179,69 +176,97 @@ class MLASelfAttention(nn.Module):
 
 class MixtureOfExperts(nn.Module):
     """
-    A Mixture of Experts layer.
+    A Mixture of Experts layer implementing Shared Expert Isolation and
+    Auxiliary-Loss-Free Load Balancing.
     """
     def __init__(self, config):
         super().__init__()
+        assert config.n_experts_per_token > config.n_shared_experts
+        self.config = config
         self.n_experts = config.n_experts
-        self.n_experts_per_token = config.n_experts_per_token
+        self.n_shared_experts = config.n_shared_experts
+        self.n_routed_experts = self.n_experts - self.n_shared_experts
+        self.n_routed_experts_per_token = config.n_experts_per_token - config.n_shared_experts
 
-        # Gating network: a linear layer that determines which expert to send each token to
-        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
-        # Create the expert networks
+        self.gate = nn.Linear(config.n_embd, self.n_routed_experts, bias=False)
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.n_experts)])
-        self.aux_loss_weight = config.aux_loss_weight
+        
+        #  Add the learnable bias for load balancing ---
+        # This parameter is manually updated, not through backpropagation.
+        self.load_balancing_bias = nn.Parameter(torch.zeros(self.n_routed_experts))
+        self.load_balancing_bias.requires_grad = False
 
     def forward(self, x):
         B, T, C = x.shape
-        x_reshaped = x.view(-1, C) # (B*T, C)
+        x_reshaped = x.view(-1, C)
+        n_tokens = x_reshaped.shape[0]
 
-        # Get routing logits from the gating network
-        gate_logits = self.gate(x_reshaped) # (B*T, n_experts)
+        #  Process Shared Experts (same as before) ---
+        shared_output = torch.zeros_like(x_reshaped)
+        for i in range(self.n_shared_experts):
+            shared_output += self.experts[i](x_reshaped)
 
-        # Find top k experts for each token
-        top_k_weights, top_k_indices = torch.topk(gate_logits, self.n_experts_per_token, dim=-1) # (B*T, n_experts_per_token)
-        top_k_weights = F.softmax(top_k_weights, dim=-1, dtype=torch.float32).to(x.dtype)
+        # Loss-Free Load Balancing Logic ---
+        # 1. Get routed logits and apply bias for selection
+        routed_logits = self.gate(x_reshaped)
+        selection_logits = routed_logits + self.load_balancing_bias
+        
+        # 2. Perform Top-K selection on the biased logits
+        top_k_indices_routed = torch.topk(selection_logits, self.n_routed_experts_per_token, dim=-1).indices
 
-      
-        all_probs = F.softmax(gate_logits, dim=-1, dtype=torch.float32) # (B*T, n_experts)
-        tokens_per_expert_fraction = torch.mean(all_probs, dim=0) # Shape: (n_experts)
+        # 3. Calculate gating weights from the ORIGINAL, unbiased logits
+        routed_probs = F.softmax(routed_logits, dim=-1, dtype=torch.float32)
+        # Gather the probabilities of the chosen experts
+        top_k_weights = torch.gather(routed_probs, -1, top_k_indices_routed)
+        # This is not re-normalized, as per the paper's formulation
 
-        sum_of_squares = torch.sum(tokens_per_expert_fraction**2)
-        aux_loss = self.aux_loss_weight * self.n_experts * sum_of_squares
-        # Initialize final output tensor
-        final_output = torch.zeros_like(x_reshaped)
+        # --- 4. Manually update the load-balancing bias during training ---
+        if self.training:
+            with torch.no_grad():
+                # Get a one-hot mask of which experts were chosen for each token
+                expert_mask = F.one_hot(top_k_indices_routed, num_classes=self.n_routed_experts)
+                # Calculate the load fraction for each expert (how often it was chosen)
+                load_fraction = expert_mask.float().sum(dim=(0, 1)) / (n_tokens * self.n_routed_experts_per_token)
+                # The ideal load is uniform
+                ideal_load = 1.0 / self.n_routed_experts
+                
+                # Calculate the update amount
+                update = (load_fraction - ideal_load) * self.config.bias_update_gamma
+                
+                # Update the bias: decrease for overloaded, increase for underloaded
+                self.load_balancing_bias.data -= update
 
-        # This part is a bit tricky. We need to efficiently route each token only to its assigned experts.
-        # We'll use index_add_ for an efficient scatter-add operation.
+        # --- Dispatch to routed experts (same as before, but no aux_loss) ---
+        top_k_indices = top_k_indices_routed + self.n_shared_experts
+        routed_output = torch.zeros_like(x_reshaped)
         flat_top_k_indices = top_k_indices.view(-1)
-        # Repeat the input tokens k times for k experts
-        repeated_x = x_reshaped.repeat_interleave(self.n_experts_per_token, dim=0)
-        # Get the outputs from all selected experts
+        repeated_x = x_reshaped.repeat_interleave(self.n_routed_experts_per_token, dim=0)
+
         expert_outputs = torch.empty_like(repeated_x)
-        for i in range(self.n_experts):
-            # Find which tokens are routed to this expert
+        for i in range(self.n_shared_experts, self.n_experts):
             mask = (flat_top_k_indices == i)
             if mask.any():
-                # --- MODIFICATION: Cast expert output to match destination dtype ---
                 expert_outputs[mask] = self.experts[i](repeated_x[mask]).to(expert_outputs.dtype)
 
-
-        # Weight the expert outputs and sum them up
         weighted_outputs = expert_outputs * top_k_weights.view(-1, 1)
-        # Create an index to scatter-add the outputs back to their original token positions
-        original_indices = torch.arange(x_reshaped.size(0), device=x.device).repeat_interleave(self.n_experts_per_token)
-        final_output.index_add_(0, original_indices, weighted_outputs)
+        original_indices = torch.arange(n_tokens, device=x.device).repeat_interleave(self.n_routed_experts_per_token)
+        routed_output.index_add_(0, original_indices, weighted_outputs)
+
+        final_output = shared_output + routed_output
         
-        return final_output.view(B, T, C), aux_loss
+        # --- MODIFICATION: Return None for the auxiliary loss ---
+        return final_output.view(B, T, C), None
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        # Cast the hidden dimension to an integer
+        hidden_dim = int(config.n_embd * config.mlp_expansion_factor)
+        
+        self.c_fc    = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -250,6 +275,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+
 
 class Block(nn.Module):
 
@@ -260,35 +286,40 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MixtureOfExperts(config)
 
-    def forward(self, x, past_kv=None, total_aux_loss=None):
-        # Attention part remains the same
+    
+    def forward(self, x, past_kv=None):
         attn_output, present_kv = self.attn(self.ln_1(x), past_kv=past_kv)
         x = x + attn_output
-        
-        # The MLP now returns the main output and an auxiliary loss
-        mlp_output, aux_loss = self.mlp(self.ln_2(x))
+        mlp_output, _ = self.mlp(self.ln_2(x))
         x = x + mlp_output
         
-        # Accumulate the auxiliary loss from this block
-        if total_aux_loss is not None:
-            total_aux_loss += aux_loss
-            
-        return x, present_kv, total_aux_loss
+       
+        return x, present_kv
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    d_latent:int = 128 # the new latent model
+    vocab_size: int = 50304
+    n_layer: int = 6
+    n_head: int = 8
+    n_embd: int = 512
+    d_latent: int = 64 # set it smaller
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    n_experts: int = 8  # Number of experts
-    n_experts_per_token: int = 2 # Number of experts to route each token to
-    aux_loss_weight: float = 1e-4 # Scaling factor for the load balancing loss
+    bias: bool = True
+    n_experts: int = 8
+    n_experts_per_token: int = 4
+    n_shared_experts: int = 2
+    mlp_expansion_factor: int = 2
+    # --- NEW: Add bias update gamma and remove aux_loss_weight ---
+    bias_update_gamma: float = 1e-2 # Learning rate for the load balancing bias
+    # aux_loss_weight is no longer needed
 
+    n_shared_experts: int = 2 # Number of experts to always activate
+
+    #n_eexperts_per_token > n_shared_experts 
+
+    # n_expert_groups is no longer needed for this approach
+    aux_loss_weight: float = 1e-4
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -299,30 +330,41 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            # wpe is removed
+            # wpe is removed because RoPE is used in the attention blocks
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        total_params = self.get_num_params()
+        print(f"number of parameters: {total_params/1e6:.2f}M")
 
+        # if it's an MoE model, print detailed stats
+        if hasattr(config, 'n_experts') and config.n_experts > 0:
+            # calculate params for one MLP expert and one full MoE layer
+            mlp_params = sum(p.numel() for p in MLP(config).parameters())
+            moe_params = sum(p.numel() for p in MixtureOfExperts(config).parameters())
+            
+            # calculate active params: non-expert params + params for active experts
+            non_expert_moe_params = moe_params - (config.n_experts * mlp_params)
+            active_moe_params = non_expert_moe_params + (config.n_experts_per_token * mlp_params)
+
+            print("---")
+            print(f"MoE Configuration:")
+            print(f"  - MoE Layers: {config.n_layer}")
+            print(f"  - Params per MoE Layer: {moe_params:,} (~{moe_params/1e6:.2f}M)")
+            print(f"  - Active Params per MoE Layer: {int(active_moe_params):,} (~{active_moe_params/1e6:.2f}M)")
+            print("---")
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -331,9 +373,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        # The non_embedding flag is no longer used since wpe is removed with RoPE
-        # You can simply return the total parameters or keep the logic for other embeddings
-        # if you plan to add them later. For now, we can just pass.
+       
+
         if non_embedding:
             # We no longer subtract wpe, because it doesn't exist.
             pass
@@ -347,11 +388,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    # In mla_model.py, inside the GPT class
+
     def forward(self, idx, targets=None, past_kv_cache=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -363,33 +405,31 @@ class GPT(nn.Module):
         present_kv_cache = []
         x = self.transformer.drop(tok_emb)
         
-        # --- MODIFICATION: Initialize and accumulate auxiliary loss ---
-        total_aux_loss = 0.0 if targets is not None else None # Only calculate loss during training
-
+       
         for i, block in enumerate(self.transformer.h):
-            x, present_kv, total_aux_loss = block(x, past_kv=past_kv_cache[i], total_aux_loss=total_aux_loss)
+            # The block's forward call is now simpler
+            x, present_kv = block(x, past_kv=past_kv_cache[i])
             present_kv_cache.append(present_kv)
 
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            
             logits = self.lm_head(x)
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            # --- MODIFICATION: Add auxiliary loss to the main loss ---
-            loss = main_loss + total_aux_loss
+            # --- MODIFICATION: Loss is now a single value ---
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
+            
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         if is_inference:
-        # If we are generating, return the cache
+            # If we are generating, return the cache
             return logits, loss, present_kv_cache
         else:
-        # If we are training/evaluating, return only logits and loss
-            # It can be helpful to return both for logging
-            return logits, (loss, main_loss, total_aux_loss)
+            # --- MODIFICATION: Return the single loss tensor, not a tuple ---
+            return logits, loss
+        
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -447,6 +487,7 @@ class GPT(nn.Module):
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
