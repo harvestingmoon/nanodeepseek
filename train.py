@@ -38,21 +38,32 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+vocab_size = 50304
 # model
-n_layer = 12
-n_head = 12
-n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# --- MODIFICATION: Updated for auxiliary-loss-free MoE model ---
+# --- UPDATED: MTP (Multi-Token Prediction) Architecture ---
+n_main_layers = 8       # Number of layers in the shared backbone
+n_branch_layers = 2     # Number of layers in each MTP branch
+n_mtp_branches = 2      # Number of parallel MTP branches
+n_tokens_per_branch = (1, 1) # How many future tokens each branch predicts
+
+# --- Standard Transformer & MLA (Multi-Head Latent Attention) ---
+n_head = 8
+n_embd = 512
+d_latent = 64           # Latent dimension for MLA compression
+dropout = 0.0           # For pretraining 0 is good, for finetuning try 0.1+
+bias = True             # Recommended True for RMSNorm and other layers
+
+# --- MoE (Mixture of Experts) ---
 n_experts = 8
 n_experts_per_token = 4
 n_shared_experts = 2
+mlp_expansion_factor = 2
 bias_update_gamma = 1e-2
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -70,13 +81,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
-
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -138,11 +144,36 @@ if os.path.exists(meta_path):
 
 # model init
 # --- MODIFICATION: Updated model_args for the new MoE config ---
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout,
-                  n_experts=n_experts, n_experts_per_token=n_experts_per_token,
-                  n_shared_experts=n_shared_experts, bias_update_gamma=bias_update_gamma)
+# First, make sure you have defined all the necessary variables:
+# e.g., n_main_layers, n_branch_layers, n_embd, vocab_size, etc.
 
+# These arguments now directly match the fields in your GPTConfig
+model_args = dict(
+    # MTP Architecture Config
+    n_main_layers=n_main_layers,
+    n_branch_layers=n_branch_layers,
+    n_mtp_branches=n_mtp_branches,
+    n_tokens_per_branch=n_tokens_per_branch,
+
+    # Standard Transformer/MoE Config
+    n_head=n_head,
+    n_embd=n_embd,
+    d_latent=d_latent,
+    block_size=block_size,
+    bias=bias,
+    vocab_size=vocab_size, # Ensure this is set to an integer, not None
+    dropout=dropout,
+    
+    # MoE specific
+    n_experts=n_experts,
+    n_experts_per_token=n_experts_per_token,
+    n_shared_experts=n_shared_experts,
+    mlp_expansion_factor=mlp_expansion_factor,
+    bias_update_gamma=bias_update_gamma,
+)
+
+# You can then create the config object by unpacking the dictionary
+config = GPTConfig(**model_args)
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     if meta_vocab_size is None:
