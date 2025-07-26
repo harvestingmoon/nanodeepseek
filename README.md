@@ -42,9 +42,9 @@ Each MoE layer has about 9.45m params with about 7.08m active params per layer (
 
 ### How To train: 
 
-1. Fork Andrej Karpathy's NanoGPT repo
-2. Replace `train.py` and `model.py` with the files here 
-3. Perform the same training process as stated in the NanoGPT guide 
+For now:
+1. `pip install -r requirements.txt`
+2. `python3 custom_trainer.py`
 
 Take note, each iteration takes about 491520 tokens , the token size I have set it to about 1024
 
