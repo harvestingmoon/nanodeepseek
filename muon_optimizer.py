@@ -3,43 +3,68 @@ import torch
 import torch.distributed as dist
 
 
-def zeropower_via_newtonschulz5(G, steps: int):
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
+    zero even beyond the point where the iteration no longer converges all the way to one.
     """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
+    X = G.bfloat16() if hasattr(G, 'bfloat16') else G.float()
+    
+    # Ensure all tensors are on the same device and contiguous
+    device = X.device
+    X = X.contiguous()
     
     if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
+        X = X.mT.contiguous()
+
+    # Ensure spectral norm is at most 1
+    norm_val = X.norm(dim=(-2, -1), keepdim=True) + eps
+    X = (X / norm_val).contiguous()
+    
+    # Perform the NS iterations with explicit device management
+    for _ in range(steps):
+        A = (X @ X.mT).contiguous()
+        # Ensure all operations are on the same device
+        A = A.to(device)
+        A_squared = (A @ A).contiguous()
+        B = (b * A + c * A_squared).contiguous()
+        X = (a * X + B @ X).contiguous()
+    
+    if G.size(-2) > G.size(-1):
+        X = X.mT.contiguous()
+    return X.to(G.dtype)
 
 
 def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    # Ensure all tensors are on the same device and contiguous
+    device = grad.device
+    grad = grad.contiguous()
+    momentum = momentum.contiguous()
+    
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = update.contiguous()
+    
+    # Handle convolutional filters
     if update.ndim == 4: # for the case of conv filters
-        update = update.view(len(update), -1)
+        update = update.view(len(update), -1).contiguous()
+    
+    # Ensure update is 2D for Newton-Schulz
+    if update.ndim == 1:
+        return update  # Skip Newton-Schulz for 1D tensors (biases, etc.)
+    
+    # Apply Newton-Schulz orthogonalization
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
+    
+    # Scale by the dimension ratio
+    scale_factor = max(1, grad.size(-2) / grad.size(-1))**0.5
+    update = update * scale_factor
+    
+    return update.to(device)
 
 
 class Muon(torch.optim.Optimizer):
@@ -266,12 +291,37 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 for p in group["params"]:
                     if p.grad is None:
                         continue
+                    
+                    # Ensure grad is on the same device as parameter
+                    if p.grad.device != p.device:
+                        p.grad = p.grad.to(p.device)
+                    
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        state["momentum_buffer"] = torch.zeros_like(p, device=p.device)
+                    
+                    # Only apply Muon to 2D+ parameters (matrices)
+                    if p.grad.ndim >= 2:
+                        update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        # Handle reshape carefully
+                        if update.shape != p.shape:
+                            if update.numel() == p.numel():
+                                update = update.reshape(p.shape)
+                            else:
+                                # Fallback: use original gradient
+                                update = p.grad
+                    else:
+                        # For 1D parameters (biases), just use momentum without Newton-Schulz
+                        state["momentum_buffer"].lerp_(p.grad, 1 - group["momentum"])
+                        update = state["momentum_buffer"]
+                    
+                    # Ensure update is on correct device and has correct shape
+                    update = update.to(p.device)
+                    if update.shape != p.shape:
+                        update = update.reshape(p.shape)
+                        
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    p.add_(update, alpha=-group["lr"])
             else:
                 for p in group["params"]:
                     if p.grad is None:

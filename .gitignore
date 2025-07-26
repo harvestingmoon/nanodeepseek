@@ -12,3 +12,4 @@ env/
 venv/
 mla_debug.py
 deepseek_mtp_model
+debug_muon.py

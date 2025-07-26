@@ -18,6 +18,18 @@ This entire module represents the Deepseek module. Right now, I have implemented
 Each transformer block basically contains RMSNorm with the attention being MLA. Yes it contians the K/V Cache compression algorithm and decoupled RoPe in place too. This then concats with the previous value before undergoing RMSNorm again to a FFN that is DeepSeekMoE. DeepSeekMoE was a little more complex as I thought since it contains fine grained experts segmentations, shared expert iso and a modified aux load balancer for even distribution between experts)
 
 
+### TODO:
+- Muon Optimizer Bug (where it is unable to iterate at first epoch, for now just stick to AdamW)
+
+- CUDA support (for now has CPU & MTS support)
+
+- GRPO (r1) (via GRPOTrainer class)
+
+- FP8/BF16/BF32 Mixed Precision Training 
+
+- Dualpipe Parallelism (well probably requires some CUDA understand)
+
+
 ### Items Implemented (Just a List Checker): 
 - Multi Latent Attention (K/V cache compression algo and deCoupled RoPe in place)
 
@@ -27,11 +39,6 @@ Each transformer block basically contains RMSNorm with the attention being MLA. 
 
 - CustomMTPTrainer (as implemented in huggingface)
 
-- Muon Optimizer (fork from the original muon optimizer and implemented it )
-
-### Things I want to further implement:
-- GRPO (r1)
-- FP8 Mixed Precision Training
 
 ### Some Novel Statistics:
 

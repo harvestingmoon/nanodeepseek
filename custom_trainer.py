@@ -7,8 +7,11 @@ from transformers import (
     DataCollatorForLanguageModeling
 )
 from datasets import load_dataset
-from mla_debug import GPT, GPTConfig
+from mla_model import GPT, GPTConfig
 import inspect
+
+
+USE_MPS = True  # MPS has compatibility issues with complex model - using CPU for stability
 
 class MTPTrainer(Trainer):
     def __init__(self, optimizer_type='muon', **kwargs):
@@ -67,21 +70,37 @@ class MTPTrainer(Trainer):
             print(f"  Head params: {len(head_params)}")
             
             if self.optimizer_type.lower() == 'muon':
-                # Use SingleDeviceMuon for CPU training
-                from muon_optimizer import SingleDeviceMuon
+                # Use Muon for weight matrices and AdamW for other parameters
+                param_groups = []
                 
-                # Use only hidden matrix parameters for Muon
+                # Muon group for weight matrices
                 if hidden_matrix_params:
-                    self.optimizer = SingleDeviceMuon(
-                        hidden_matrix_params,
-                        lr=self.args.learning_rate,
-                        momentum=0.95,
-                        weight_decay=self.args.weight_decay
-                    )
-                    print(f"Using SingleDeviceMuon for {len(hidden_matrix_params)} weight matrices")
+                    param_groups.append({
+                        "params": hidden_matrix_params,
+                        "lr": self.args.learning_rate,
+                        "momentum": 0.95,
+                        "weight_decay": self.args.weight_decay,
+                        "use_muon": True
+                    })
+                
+                # AdamW groups for other parameters
+                other_params = embed_params + scalar_params + head_params
+                if other_params:
+                    param_groups.append({
+                        "params": other_params,
+                        "lr": self.args.learning_rate * 0.3,  # Lower LR for non-matrix params
+                        "betas": (0.9, 0.95),
+                        "eps": 1e-10,
+                        "weight_decay": self.args.weight_decay * 0.1,  # Lower weight decay
+                        "use_muon": False
+                    })
+                
+                if param_groups:
+                    from muon_optimizer import SingleDeviceMuonWithAuxAdam
+                    self.optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+                    print(f"Using Muon for {len(hidden_matrix_params)} matrices + AdamW for {len(other_params)} other params")
                 else:
-                    # Fallback to AdamW if no suitable parameters
-                    print("No suitable parameters for Muon, falling back to AdamW")
+                    print("No parameters found, falling back to AdamW")
                     super().create_optimizer()
                 
             elif self.optimizer_type.lower() == 'muon_hybrid':
@@ -131,20 +150,36 @@ class MTPTrainer(Trainer):
                     super().create_optimizer()
                     
             else:
-                # Fallback to default optimizer creation
+                # Use standard AdamW optimizer
+                print("Using standard AdamW optimizer")
                 super().create_optimizer()
                 
         return self.optimizer
 
-if torch.backends.mps.is_available():
-    print("MPS backend detected. Forcing CPU usage to avoid tensor format issues.")
+if USE_MPS and torch.backends.mps.is_available():
+    print("MPS backend detected and enabled.")
+    print("WARNING: MPS backend has known compatibility issues with complex models.")
+    print("If you encounter 'channels_last format' errors, set USE_MPS = False at the top of this file.")
+    torch.set_default_device("mps")
+    device = "mps"
+else:
+    if USE_MPS:
+        print("MPS requested but not available, using CPU")
+    else:
+        print("Using CPU (MPS disabled in configuration)")
     torch.set_default_device("cpu")
+    device = "cpu"
 
 # 1. Instantiate Your Model and Tokenizer
 config = GPTConfig()
 model = GPT(config)
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
+
+# Ensure model is on the correct device
+model = model.to(device)
+
+print(f"Model is on device: {next(model.parameters()).device}")
 
 
 # 2. Load and Prepare a Dataset (more on this below)
@@ -170,19 +205,20 @@ training_args = TrainingArguments(
     output_dir="./deepseek_mtp_model",
     overwrite_output_dir=True,
     num_train_epochs=1,
-    per_device_train_batch_size=2,  # Reduced batch size for CPU
+    per_device_train_batch_size=4 if device == "mps" else 2,  # Larger batch for MPS, smaller for CPU
     save_steps=1000,
     logging_steps=100,
-    learning_rate=0.02,  
+    learning_rate=0.001,  # Much lower learning rate for Muon stability
     weight_decay=0.01,   
+    max_grad_norm=1.0,   # Add gradient clipping
     remove_unused_columns=False,
-    no_cuda=True,  
-    dataloader_pin_memory=False,  
+    no_cuda=True,  # Always disable CUDA since we're using MPS or CPU
+    dataloader_pin_memory=False,  # Disable for both MPS and CPU compatibility
 )
 
-# 4. Use Your Custom Trainer with Muon optimizer
+# 4. Use Your Custom Trainer with AdamW for now (Muon version available)
 trainer = MTPTrainer(
-    optimizer_type='muon_hybrid',  # Options: 'muon', 'muon_hybrid', 'adamw'
+    optimizer_type='adamw',  # Use AdamW for reliable training
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,

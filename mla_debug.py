@@ -2,8 +2,6 @@
 Full definition of a GPT Language Model, all of it in this single file.
 Really it is a GPT Model but with DeepSeek modifications.
 
-This version has been refactored to fix data type casting issues on PyTorch's
-MPS backend and to correct logical errors in the MTP and model surgery code.
 """
 
 import math
@@ -82,34 +80,52 @@ class MLASelfAttention(nn.Module):
         all calculations in float32 and casting back only once at the end.
         """
         original_dtype = x.dtype
+        device_type = x.device.type
         
-        # Ensure tensor is contiguous and doesn't use channels_last format
-        x = x.contiguous()
+        # For MPS, we need to be extra careful with tensor layouts
+        if device_type == 'mps':
+            # Ensure input is contiguous and in a simple memory format
+            x = x.contiguous().to(memory_format=torch.contiguous_format)
+        else:
+            x = x.contiguous()
         
         # Promote all inputs to float32 for the calculation
         x_f = x.to(torch.float32).contiguous()
         cos_f = cos[:x_f.shape[2]].to(torch.float32).unsqueeze(0).unsqueeze(0).contiguous()
         sin_f = sin[:x_f.shape[2]].to(torch.float32).unsqueeze(0).unsqueeze(0).contiguous()
         
-        # Reshape
+        # Reshape with explicit contiguous calls
         B, H, T, C = x_f.shape
-        x_reshaped = x_f.reshape(B, H, T, C // 2, 2).contiguous()
+        x_reshaped = x_f.view(B, H, T, C // 2, 2).contiguous()
         x1, x2 = x_reshaped.unbind(-1)
+        x1, x2 = x1.contiguous(), x2.contiguous()
 
-        # Rotate
-        rotated_x = torch.stack((-x2, x1), dim=-1).flatten(-2).contiguous()
+        # Rotate with explicit contiguous calls
+        rotated_x = torch.stack((-x2, x1), dim=-1).contiguous()
+        rotated_x = rotated_x.view(B, H, T, C).contiguous()
 
         # Apply RoPE calculation in float32
         out_f = (x_f * cos_f) + (rotated_x * sin_f)
+        out_f = out_f.contiguous()
 
         # Cast the final result back to the original dtype and ensure contiguity
-        return out_f.to(original_dtype).contiguous()
+        result = out_f.to(original_dtype).contiguous()
+        
+        # For MPS, ensure the result has proper memory format
+        if device_type == 'mps':
+            result = result.to(memory_format=torch.contiguous_format)
+            
+        return result
 
     def forward(self, x, past_kv=None):
         B, T, C = x.size()
+        device_type = x.device.type
 
-        # Ensure input tensor is contiguous
-        x = x.contiguous()
+        # Ensure input tensor is contiguous and properly formatted for MPS
+        if device_type == 'mps':
+            x = x.contiguous().to(memory_format=torch.contiguous_format)
+        else:
+            x = x.contiguous()
 
         q_latent = self.q_down_proj(x).view(B, T, self.n_head, self.d_latent).contiguous()
         k_latent_new = self.k_down_proj(x).view(B, T, self.n_head, self.d_latent).contiguous()
@@ -151,6 +167,11 @@ class MLASelfAttention(nn.Module):
             y = att @ v
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # Ensure MPS compatibility for output
+        if device_type == 'mps':
+            y = y.to(memory_format=torch.contiguous_format)
+            
         y = self.resid_dropout(self.c_proj(y))
         
         return y, present_kv
@@ -382,7 +403,9 @@ class GPT(nn.Module):
 
             # 3. Calculate Loss (unchanged from original)
             if all_logits:
-                total_loss = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+                # Create total_loss tensor on the same device as the model
+                device = input_ids.device
+                total_loss = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
                 loss_token_offset = 1
                 for i in range(self.config.n_mtp_branches):
                     branch_logits = all_logits[i]
@@ -462,7 +485,6 @@ class GPT(nn.Module):
             # Import Muon optimizer
             from muon_optimizer import Muon
             
-            # For Muon, we typically use a higher learning rate and single parameter group
             all_params = decay_params + nodecay_params
             optimizer = Muon(
                 all_params, 
@@ -554,13 +576,9 @@ class GPT(nn.Module):
                     # Trim if sequence becomes too long
                     if current_h.size(1) > self.config.block_size:
                         current_h = current_h[:, -self.config.block_size:, :]
-            
-            # Add all generated tokens to the sequence
-            # For this implementation, we'll add them one by one in order
+
             for token in generated_tokens:
                 idx = torch.cat((idx, token), dim=1)
-                # For simplicity, break after first token for now
-                # In full implementation, you might want to add all tokens
                 break
 
         self.train()
