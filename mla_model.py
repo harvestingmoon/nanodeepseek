@@ -555,12 +555,8 @@ class GPT(nn.Module):
                     if current_h.size(1) > self.config.block_size:
                         current_h = current_h[:, -self.config.block_size:, :]
             
-            # Add all generated tokens to the sequence
-            # For this implementation, we'll add them one by one in order
             for token in generated_tokens:
                 idx = torch.cat((idx, token), dim=1)
-                # For simplicity, break after first token for now
-                # In full implementation, you might want to add all tokens
                 break
 
         self.train()

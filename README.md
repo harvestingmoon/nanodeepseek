@@ -27,7 +27,9 @@ Each transformer block basically contains RMSNorm with the attention being MLA. 
 
 - CustomMTPTrainer (as implemented in huggingface)
 
-## Things I want to further implement:
+- Muon Optimizer (fork from the original muon optimizer and implemented it )
+
+### Things I want to further implement:
 - GRPO (r1)
 - FP8 Mixed Precision Training
 
@@ -52,4 +54,6 @@ Take note, each iteration takes about 491520 tokens , the token size I have set 
 [Deepseek v2](https://arxiv.org/pdf/2405.04434)\
 [Deepseek v3](https://arxiv.org/abs/2412.19437)\
 [Deepseek r1](https://arxiv.org/pdf/2501.12948)\
-[Innovative Techniques in Deepseek](https://arxiv.org/pdf/2503.11486)
+[Innovative Techniques in Deepseek](https://arxiv.org/pdf/2503.11486)\
+[Muon Optimizer Repo](https://github.com/KellerJordan/Muon/tree/master)\
+[Muon Optimizer Writeup](https://kellerjordan.github.io/posts/muon/)

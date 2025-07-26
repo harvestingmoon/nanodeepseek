@@ -151,12 +151,11 @@ tokenizer.pad_token = tokenizer.eos_token
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
 def tokenize_function(examples):
-    # Tokenize with proper settings for language modeling
     tokenized = tokenizer(
         examples["text"], 
         truncation=True, 
         max_length=512, 
-        padding=False,  # Let the data collator handle padding
+        padding=False, 
         return_tensors=None 
     )
     return tokenized
