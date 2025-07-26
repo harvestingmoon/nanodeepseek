@@ -1,9 +1,9 @@
 ### NanoGPT Incorporating DeepSeek Things
 
-## TLDR: NanoGPT with DeepSeek 
+## TLDR: NanoGPT with DeepSeek Implementations + Muon Optimizer
 
 ### Motivation:
-This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers into a small simple and concise LLM (that is basically NanoGPT). It also allows me to better understand models at a finegrained level
+This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers into a small simple and concise LLM (that is basically NanoGPT). It is a small trained implementation of Deepseek (190m params) with a Muon Optimizer
 
 
 ### General Architecture
@@ -25,13 +25,15 @@ Each transformer block basically contains RMSNorm with the attention being MLA. 
 
 - Multi Token Prediction (3 Modules, with 1 Main and 2 MTP modules -> the main module has 8 Layers of Transformer block while each MTP has 2 layers of Transformer Block)
 
+- CustomMTPTrainer (as implemented in huggingface)
+
 ## Things I want to further implement:
 - GRPO (r1)
 - FP8 Mixed Precision Training
 
 ### Some Novel Statistics:
 
-This model contains 113.72m parameters, with about 12 MoE Layers 
+This model contains 190m parameters, with about 12 MoE Layers 
 
 Each MoE layer has about 9.45m params with about 7.08m active params per layer (layer referencing to the transformer block again)
 

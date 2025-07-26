@@ -312,7 +312,6 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # In your GPT class
 
     def forward(self, input_ids, labels=None):
         B, T = input_ids.size()
@@ -430,8 +429,7 @@ class GPT(nn.Module):
                 break
 
         return final_logits, loss
-
-        return final_logits, loss
+    
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
@@ -450,23 +448,55 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type='muon'):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
+        
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        
+        if optimizer_type.lower() == 'muon':
+            # Import Muon optimizer
+            from muon_optimizer import Muon
+            
+            # For Muon, we typically use a higher learning rate and single parameter group
+            all_params = decay_params + nodecay_params
+            optimizer = Muon(
+                all_params, 
+                lr=learning_rate, 
+                momentum=0.95,  # Typical Muon momentum
+                nesterov=True
+            )
+            print(f"using Muon optimizer with lr={learning_rate}")
+            
+        elif optimizer_type.lower() == 'muon_hybrid':
+            from muon_optimizer import MuonAdamHybrid
+            # Use hybrid approach: Muon for weights, Adam for biases/norms
+            all_params = decay_params + nodecay_params
+            optimizer = MuonAdamHybrid(
+                all_params,
+                lr=learning_rate * 0.1,  # Lower Adam LR
+                muon_lr=learning_rate,   # Higher Muon LR
+                muon_momentum=0.95,
+                weight_decay=weight_decay,
+                use_muon_for_weights=True
+            )
+            print(f"using Muon+Adam hybrid optimizer with muon_lr={learning_rate}, adam_lr={learning_rate * 0.1}")
+            
+        else:
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
+            
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
