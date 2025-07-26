@@ -6,12 +6,11 @@ Really it is a GPT Model but with DeepSeek modifications
 import math
 import inspect
 from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
+class RMSNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, eps: float = 1e-5):
@@ -23,7 +22,6 @@ class LayerNorm(nn.Module):
         """ 
             Applying RMS Normalization
         """
-        # (B, T, C) * (B, T, 1) = (B, T, C)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
@@ -55,7 +53,7 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -80,14 +78,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-
-# In mla_model.py
-
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import math
-
 class MLASelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -105,8 +95,6 @@ class MLASelfAttention(nn.Module):
         self.d_head_c = self.d_head // 2 # "Context" part, plain
         
         self.dropout = config.dropout
-
-        # --- Down-projection layers (h_t -> c_t) ---
         self.q_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
         self.k_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
         self.v_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
@@ -118,13 +106,11 @@ class MLASelfAttention(nn.Module):
         self.k_up_proj_c = nn.Linear(self.d_latent, self.d_head_c, bias=config.bias)
         self.k_up_proj_e = nn.Linear(self.d_latent, self.d_head_e, bias=config.bias)
         
-        # Value path does not have concatenation or RoPE
         self.v_up_proj = nn.Linear(self.d_latent, self.d_head, bias=config.bias)
 
-        # --- Final output projection ---
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=config.bias)
 
-        # --- Regularization ---
+       
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attn_dropout = nn.Dropout(config.dropout)
 
@@ -139,7 +125,6 @@ class MLASelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def precompute_rope_cache(self, dim, max_seq_len, theta=10000.0):
-        # This function remains the same
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
@@ -211,6 +196,24 @@ class MLASelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         
         return y, present_kv
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = int(config.n_embd * config.mlp_expansion_factor)
+        self.c_fc    = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
 
 class MixtureOfExperts(nn.Module):
     """
@@ -298,35 +301,13 @@ class MixtureOfExperts(nn.Module):
         return final_output.view(B, T, C), None
 
 
-
-# Dont even need it anymore lol``
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        # Cast the hidden dimension to an integer
-        hidden_dim = int(config.n_embd * config.mlp_expansion_factor)
-        
-        self.c_fc    = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd) 
+        self.ln_1 = RMSNorm(config.n_embd) 
         self.attn = MLASelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd) 
+        self.ln_2 = RMSNorm(config.n_embd) 
         self.mlp = MixtureOfExperts(config)
 
     
@@ -356,7 +337,6 @@ class GPTConfig:
     # Total predicted tokens per step = sum(n_tokens_per_branch)
     n_tokens_per_branch: tuple = (1, 1)
 
-    # --- Standard Transformer/MoE Config (as before) ---
     n_head: int = 8
     d_latent: int = 64
     n_experts: int = 8
@@ -389,7 +369,7 @@ class GPT(nn.Module):
                 nn.ModuleList([Block(config) for _ in range(config.n_branch_layers)])
                 for _ in range(config.n_mtp_branches)
             ]),
-            ln_f = LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_heads = nn.ModuleList([
             nn.Linear(config.n_embd, config.vocab_size, bias=False) for _ in range(config.n_mtp_branches)
@@ -400,7 +380,6 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
         print(f"number of parameters: {self.get_num_params()/1e6:.2f}M")
 
-    # __init__ helper methods (get_num_params, _init_weights) remain the same...
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
@@ -414,8 +393,6 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 
-    # In mla_model.py, inside the GPT class
-
     def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
@@ -426,7 +403,7 @@ class GPT(nn.Module):
         for block in self.transformer.h_main:
             x, _ = block(x)
 
-        # This is the initial hidden state for the MTP chain
+        
         current_h = x
         all_logits = []
         loss = None
@@ -449,11 +426,9 @@ class GPT(nn.Module):
                     next_target_tokens = targets[:, token_offset : token_offset + num_predicted].contiguous()
                     next_target_emb = self.transformer.wte(next_target_tokens)
                     T_next = next_target_emb.shape[1]
-                    # Fuse the branch output with the ground-truth embedding
                     current_h = branch_h[:, :T_next, :] + next_target_emb
                     token_offset += num_predicted
 
-            # --- Correctly Integrated Loss Calculation ---
             if all_logits: # Only calculate loss if logits were generated
                 total_loss = 0
                 loss_token_offset = 1
@@ -462,11 +437,9 @@ class GPT(nn.Module):
                     num_predicted = self.config.n_tokens_per_branch[i]
                     for j in range(num_predicted):
                         current_offset = loss_token_offset + j
-                        # This slicing is now safe
                         current_logits = branch_logits[:, :-current_offset, :].contiguous()
                         current_targets = targets[:, current_offset:].contiguous()
                         
-                        # This check prevents the error
                         if current_logits.size(1) > 0 and current_targets.size(1) > 0:
                             l = F.cross_entropy(
                                 current_logits.view(-1, current_logits.size(-1)),
@@ -480,9 +453,7 @@ class GPT(nn.Module):
         # For training, we can return the first set of logits for monitoring purposes
         final_logits = all_logits[0] if all_logits else None
 
-        # This path is for inference, where targets=None
         if targets is None:
-            # We only need to run the first branch to generate the next token
             branch_h = current_h
             for block in self.transformer.h_branches[0]:
                 branch_h, _ = block(branch_h)
@@ -496,7 +467,12 @@ class GPT(nn.Module):
         # model surgery to decrease the block size if necessary
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        
+    
+        all_blocks = self.transformer.h_main
+        for branch in self.transformer.h_branches:
+            all_blocks.extend(branch)
+
+
         # With RoPE, we don't crop a weight table. Instead, we recompute
         # the RoPE cache in each attention block with the new block size.
         for block in self.transformer.h:
@@ -508,63 +484,6 @@ class GPT(nn.Module):
             # The logic for the causal mask 'bias' remains the same
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-    # @classmethod
-    # def from_pretrained(cls, model_type, override_args=None):
-    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-    #     override_args = override_args or {} # default to empty dict
-    #     # only dropout can be overridden see more notes below
-    #     assert all(k == 'dropout' for k in override_args)
-    #     from transformers import GPT2LMHeadModel
-    #     print("loading weights from pretrained gpt: %s" % model_type)
-
-    #     # n_layer, n_head and n_embd are determined from model_type
-    #     config_args = {
-    #         'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-    #         'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-    #         'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-    #         'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-    #     }[model_type]
-    #     print("forcing vocab_size=50257, block_size=1024, bias=True")
-    #     config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-    #     config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-    #     config_args['bias'] = True # always True for GPT model checkpoints
-    #     # we can override the dropout rate, if desired
-    #     if 'dropout' in override_args:
-    #         print(f"overriding dropout rate to {override_args['dropout']}")
-    #         config_args['dropout'] = override_args['dropout']
-    #     # create a from-scratch initialized minGPT model
-    #     config = GPTConfig(**config_args)
-    #     model = GPT(config)
-    #     sd = model.state_dict()
-    #     sd_keys = sd.keys()
-    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-    #     # init a huggingface/transformers model
-    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-    #     sd_hf = model_hf.state_dict()
-
-    #     # copy while ensuring all of the parameters are aligned and match in names and shapes
-    #     sd_keys_hf = sd_hf.keys()
-    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-
-    #     # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-    #     # this means that we have to transpose these weights when we import them
-    #     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-    #     for k in sd_keys_hf:
-    #         if any(k.endswith(w) for w in transposed):
-    #             # special treatment for the Conv1D weights we need to transpose
-    #             assert sd_hf[k].shape[::-1] == sd[k].shape
-    #             with torch.no_grad():
-    #                 sd[k].copy_(sd_hf[k].t())
-    #         else:
-    #             # vanilla copy over the other parameters
-    #             assert sd_hf[k].shape == sd[k].shape
-    #             with torch.no_grad():
-    #                 sd[k].copy_(sd_hf[k])
-
-    #     return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -583,7 +502,6 @@ class GPT(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
@@ -629,31 +547,22 @@ class GPT(nn.Module):
             # 2. Sequentially run the MTP branches
             for i, branch_blocks in enumerate(self.transformer.h_branches):
                 # We only care about the *last* token's representation for generation
-                # but we process the whole sequence for the KV cache to be correct.
+                # but we process the whole sequence for the KV cache to be correct
                 branch_h = current_h
                 for block in branch_blocks:
                     branch_h, _ = block(branch_h)
                 
-                # Get logits for the last token
                 final_h = self.transformer.ln_f(branch_h)
-                logits = self.lm_heads[i](final_h[:, -1, :]) # Shape: (B, Vocab_Size)
-                
-                # Apply sampling strategy (temp, top-k)
+                logits = self.lm_heads[i](final_h[:, -1, :])
                 logits = logits / temperature
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
                 probs = F.softmax(logits, dim=-1)
-                
-                # Sample the next token
                 idx_next = torch.multinomial(probs, num_samples=1)
-                
-                # Append the newly generated token to the sequence
                 idx = torch.cat((idx, idx_next), dim=1)
                 if i < self.config.n_mtp_branches - 1:
-                    # Get the embedding of the token we just sampled
                     next_token_emb = self.transformer.wte(idx_next) # Shape: (B, 1, C)
-                    # Fuse it with the last hidden state of the current branch
                     current_h = branch_h[:, -1:, :] + next_token_emb
 
         self.train()
