@@ -110,7 +110,7 @@ def interactive_chat(model, tokenizer):
             prompt = input("\n👤 You: ").strip()
             
             if prompt.lower() in ['quit', 'exit']:
-                print("👋 Goodbye!")
+                print(" Goodbye!")
                 break
             
             elif prompt.startswith('temp '):

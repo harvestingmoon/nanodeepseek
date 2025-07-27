@@ -10,6 +10,6 @@ __pycache__/
 input.txt
 env/
 venv/
-mla_debug.py
 deepseek_mtp_model
 debug_muon.py
+mla_debug.py

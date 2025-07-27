@@ -8,10 +8,9 @@ from transformers import (
 )
 from datasets import load_dataset
 from mla_model import GPT, GPTConfig
-import inspect
 
 
-USE_MPS = True  # MPS has compatibility issues with complex model - using CPU for stability
+USE_MPS = True  
 
 class MTPTrainer(Trainer):
     def __init__(self, optimizer_type='muon', **kwargs):
@@ -19,7 +18,6 @@ class MTPTrainer(Trainer):
         super().__init__(**kwargs)
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Ensure input_ids and labels are long tensors
         input_ids = inputs.get("input_ids")
         labels = inputs.get("labels")
         
@@ -42,7 +40,6 @@ class MTPTrainer(Trainer):
         Setup the optimizer using the proper Muon implementation with parameter groups.
         """
         if self.optimizer is None:
-            # Separate parameters as recommended by Muon paper
             hidden_matrix_params = []
             embed_params = []
             scalar_params = []
@@ -56,7 +53,7 @@ class MTPTrainer(Trainer):
                     embed_params.append(param)
                 elif "lm_head" in name:  # Output head parameters
                     head_params.append(param)
-                elif param.dim() < 2:  # Biases and layer norms (scalar parameters)
+                elif param.dim() < 2:  
                     scalar_params.append(param)
                 elif param.dim() >= 2:  # Weight matrices
                     hidden_matrix_params.append(param)
@@ -114,21 +111,21 @@ class MTPTrainer(Trainer):
                 if head_params:
                     param_groups.append({
                         "params": head_params, 
-                        "lr": self.args.learning_rate * 0.5,  # Lower LR for head
+                        "lr": self.args.learning_rate * 0.5,  
                         "use_muon": False
                     })
                 
                 if embed_params:
                     param_groups.append({
                         "params": embed_params, 
-                        "lr": self.args.learning_rate * 0.3,  # Lower LR for embeddings
+                        "lr": self.args.learning_rate * 0.3,  
                         "use_muon": False
                     })
                 
                 if scalar_params:
                     param_groups.append({
                         "params": scalar_params, 
-                        "lr": self.args.learning_rate * 0.1,  # Much lower LR for scalars
+                        "lr": self.args.learning_rate * 0.1, 
                         "use_muon": False
                     })
                 
@@ -182,41 +179,107 @@ model = model.to(device)
 print(f"Model is on device: {next(model.parameters()).device}")
 
 
-# 2. Load and Prepare a Dataset (more on this below)
-dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+# 2. Load and Prepare lmsys-chat-1m Dataset
+dataset = load_dataset("lmsys/lmsys-chat-1m", split="train")
+dataset_name = "lmsys-chat-1m"
+
+subset_size = 100000  # Use 100k examples for training
+dataset = dataset.select(range(min(subset_size, len(dataset))))
+print(f"Using {len(dataset)} examples from {dataset_name} dataset")
+
+def format_instruction_data(examples):
+    formatted_texts = []
+    
+    for i in range(len(examples)):
+        if dataset_name == "lmsys-chat-1m":
+            # Format for lmsys-chat-1m
+            conversation = examples['conversation'][i]
+            text = ""
+            for turn in conversation:
+                if turn['role'] == 'user':
+                    text += f"### User:\n{turn['content']}\n\n"
+                elif turn['role'] == 'assistant':
+                    text += f"### Assistant:\n{turn['content']}\n\n"
+                elif turn['role'] == 'system':
+                    text += f"### System:\n{turn['content']}\n\n"
+        elif dataset_name == "Infinity-Instruct":
+            conversations = examples['conversations'][i]
+            text = ""
+            for turn in conversations:
+                if turn['from'] == 'human':
+                    text += f"### Instruction:\n{turn['value']}\n\n"
+                elif turn['from'] == 'gpt':
+                    text += f"### Response:\n{turn['value']}\n\n"
+        elif dataset_name == "OpenOrca":
+            system_message = examples['system_prompt'][i] if 'system_prompt' in examples else ""
+            question = examples['question'][i]
+            response = examples['response'][i]
+            
+            text = ""
+            if system_message:
+                text += f"### System:\n{system_message}\n\n"
+            text += f"### Instruction:\n{question}\n\n"
+            text += f"### Response:\n{response}\n\n"
+        
+        # Add end token
+        text += tokenizer.eos_token
+        formatted_texts.append(text)
+    
+    return {"text": formatted_texts}
+
+print("Formatting instruction data...")
+formatted_dataset = dataset.map(
+    format_instruction_data, 
+    batched=True, 
+    remove_columns=dataset.column_names,
+    desc="Formatting conversations"
+)
 
 def tokenize_function(examples):
     tokenized = tokenizer(
         examples["text"], 
         truncation=True, 
-        max_length=512, 
+        max_length=1024, 
         padding=False, 
         return_tensors=None 
     )
     return tokenized
 
-tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+print("Tokenizing dataset...")
+tokenized_dataset = formatted_dataset.map(
+    tokenize_function, 
+    batched=True, 
+    remove_columns=["text"],
+    desc="Tokenizing"
+)
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-# 3. Define Training Arguments
+# 3. Define Training Arguments for continuing training
 from transformers import TrainingArguments
 
 training_args = TrainingArguments(
     output_dir="./deepseek_mtp_model",
-    overwrite_output_dir=True,
+    overwrite_output_dir=False,  
     num_train_epochs=1,
-    per_device_train_batch_size=4 if device == "mps" else 2,  # Larger batch for MPS, smaller for CPU
+    per_device_train_batch_size=4 if device == "mps" else 2,
     save_steps=1000,
     logging_steps=100,
-    learning_rate=0.001,  # Much lower learning rate for Muon stability
+    learning_rate=0.0003,  
     weight_decay=0.01,   
-    max_grad_norm=1.0,   # Add gradient clipping
+    max_grad_norm=1.0,
     remove_unused_columns=False,
-    no_cuda=True,  # Always disable CUDA since we're using MPS or CPU
-    dataloader_pin_memory=False,  # Disable for both MPS and CPU compatibility
+    no_cuda=True,
+    dataloader_pin_memory=False,
+    
+    resume_from_checkpoint="./deepseek_mtp_model/checkpoint-18360",  
+    max_steps=28360, 
+    save_total_limit=5,  
+    warmup_steps=200,  
+    lr_scheduler_type="cosine", 
 )
 
-# 4. Use Your Custom Trainer with AdamW for now (Muon version available)
+# 4. Initialize trainer for continued training
+print("Setting up trainer for continued training...")
 trainer = MTPTrainer(
     optimizer_type='adamw',  # Use AdamW for reliable training
     model=model,
@@ -226,18 +289,17 @@ trainer = MTPTrainer(
     tokenizer=tokenizer,
 )
 
+print("\n" + "="*60)
+print("--- TRAINING CONTINUATION SETUP ---")
+print(f"Dataset: {dataset_name} (subset of {len(tokenized_dataset)} examples)")
+print(f"Resuming from: checkpoint-18360")
+print(f"Target total steps: 28360 (10000 new steps)")
+print(f"Learning rate: {training_args.learning_rate}")
+print(f"Batch size: {training_args.per_device_train_batch_size}")
+print(f"Device: {device}")
+print("="*60 + "\n")
 
-print("\n" + "="*50)
-print("--- DEBUGGING MODEL SIGNATURE ---")
-try:
-    forward_signature = inspect.signature(model.forward)
-    print(f"The 'forward' method signature is: {forward_signature}")
-except AttributeError:
-    print("ERROR: The model does not have a 'forward' method!")
-print("="*50 + "\n")
+print("Starting continued training on lmsys-chat-1m data...")
+trainer.train(resume_from_checkpoint="./deepseek_mtp_model/checkpoint-18360")
 
-
-print("🚀 Starting training...")
-trainer.train()
-
-print("✅ Training completed!")
+print("Training completed!")
