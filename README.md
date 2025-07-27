@@ -1,21 +1,23 @@
-### NanoGPT Incorporating DeepSeek Things
-
-## TLDR: NanoGPT with DeepSeek Implementations + Muon Optimizer
+## A heavily modified NanoGPT 
 
 ### Motivation:
-This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers into a small simple and concise LLM (that is basically NanoGPT). It is a small trained implementation of Deepseek (190m params) with a Muon Optimizer
-
+This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers & other relative research papers into a small simple and concise LLM (that is basically NanoGPT). It is a small trained implementation of Deepseek (190m params) with a Muon Optimizer & several novel research ideas
 
 ### General Architecture
 ![alt text](image.png)
 
-This entire module represents the Deepseek module. Right now, I have implemented 3 MTP Blocks (1 Main module and 2 MTP Modules). The main module contains 8 Layers of Transformer block while each of the remaining MTP modules only contains 2 layers of transformer block (albeit they put only 1 there -> possibly because most of the context and space representation is already done in the main module).
+Right now, I have implemented 3 MTP Blocks (1 Main module and 2 MTP Modules). The main module contains 8 Layers of Transformer block while each of the remaining MTP modules only contains 2 layers of transformer block (albeit they put only 1 there -> possibly because most of the context and space representation is already done in the main module)
 
 
 
 ![alt](image-1.png)
 
-Each transformer block basically contains RMSNorm with the attention being MLA. Yes it contians the K/V Cache compression algorithm and decoupled RoPe in place too. This then concats with the previous value before undergoing RMSNorm again to a FFN that is DeepSeekMoE. DeepSeekMoE was a little more complex as I thought since it contains fine grained experts segmentations, shared expert iso and a modified aux load balancer for even distribution between experts)
+Each transformer block basically contains RMSNorm with the attention being MLA. Yes it contians the K/V Cache compression algorithm and decoupled RoPe in place too. This then concats with the previous value before undergoing RMSNorm again to a FFN that is DeepSeekMoE. 
+
+DeepSeekMoE was a little more complex as I thought since it contains fine grained experts segmentations, shared expert iso and a modified aux load balancer for even distribution between experts.
+
+In the future, I am also implementing MoBA for long context windows (as proposed by the Kimi research paper)
+
 
 
 ### TODO:
@@ -23,7 +25,9 @@ Each transformer block basically contains RMSNorm with the attention being MLA. 
 
 - CUDA support (for now has CPU & MTS support)
 
-- GRPO (r1) (via GRPOTrainer class)
+- GRPO (r1) (via GRPOTrainer class) 
+
+- MoBA (Mixture of Block Attn module) for long context LLMs
 
 - FP8/BF16/BF32 Mixed Precision Training 
 
@@ -36,6 +40,8 @@ Each transformer block basically contains RMSNorm with the attention being MLA. 
 - DeepSeekMoE (with fine grained expert segmentation, shared expert isolation and a modified auxillary load balacer)
 
 - Multi Token Prediction (3 Modules, with 1 Main and 2 MTP modules -> the main module has 8 Layers of Transformer block while each MTP has 2 layers of Transformer Block)
+
+- Inference class
 
 - CustomMTPTrainer (as implemented in huggingface)
 
@@ -56,11 +62,28 @@ For now:
 Take note, each iteration takes about 491520 tokens , the token size I have set it to about 1024
 
 
-#### DeepSeek Papers: 
+### Currently Training:
+
+So far, I have trained the model on several datasets, including
+
+- wikicorpus
+- OpenOrca
+- InfinityInstruct (to be trianed)
+- lmsys-chat-1m (to be trained)
+
+If you have any other suggestions for better datasets, do let me know
+
+
+### How to inference
+
+Use `inference.py` , remember to load it on the different specific checkpoint that you have trained!
+
+#### Papers for reference: 
 
 [Deepseek v2](https://arxiv.org/pdf/2405.04434)\
 [Deepseek v3](https://arxiv.org/abs/2412.19437)\
 [Deepseek r1](https://arxiv.org/pdf/2501.12948)\
 [Innovative Techniques in Deepseek](https://arxiv.org/pdf/2503.11486)\
 [Muon Optimizer Repo](https://github.com/KellerJordan/Muon/tree/master)\
-[Muon Optimizer Writeup](https://kellerjordan.github.io/posts/muon/)
+[Muon Optimizer Writeup](https://kellerjordan.github.io/posts/muon/)\
+[Mixture of Block Attn](https://github.com/MoonshotAI/MoBA?tab=readme-ov-file)
