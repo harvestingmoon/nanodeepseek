@@ -92,7 +92,7 @@ def generate_text(model, tokenizer, prompt="Once upon a time", max_length=100, t
 def interactive_chat(model, tokenizer):
     """Interactive chat mode with the model."""
     
-    print("\n🤖 Interactive Chat Mode")
+    print("\nInteractive Chat Mode")
     print("=" * 50)
     print("Enter prompts to generate text. Type 'quit' to exit.")
     print("Commands:")
@@ -107,7 +107,7 @@ def interactive_chat(model, tokenizer):
     
     while True:
         try:
-            prompt = input("\n👤 You: ").strip()
+            prompt = input("\n You: ").strip()
             
             if prompt.lower() in ['quit', 'exit']:
                 print(" Goodbye!")
@@ -125,7 +125,7 @@ def interactive_chat(model, tokenizer):
             elif prompt.startswith('length '):
                 try:
                     max_length = int(prompt.split()[1])
-                    print(f"📏 Max length set to {max_length}")
+                    print(f" Max length set to {max_length}")
                     continue
                 except:
                     print(" Invalid length format. Use 'length 50'")
@@ -134,7 +134,7 @@ def interactive_chat(model, tokenizer):
             elif not prompt:
                 continue
             
-            print("🤖 Generating...")
+            print("Generating...")
             generated_text = generate_text(
                 model, tokenizer, prompt, 
                 max_length=max_length, 
@@ -143,7 +143,7 @@ def interactive_chat(model, tokenizer):
             )
             
             response = generated_text[len(prompt):].strip()
-            print(f"🤖 Bot: {response}")
+            print(f" Bot: {response}")
             
         except KeyboardInterrupt:
             print("\n Goodbye!")

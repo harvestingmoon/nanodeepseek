@@ -21,7 +21,6 @@ class RMSNorm(nn.Module):
         """
         Applying RMS Normalization. Calculation is done in float32 for stability.
         """
-        # Calculate in float32, then cast back to the original type of x
         return (x * torch.rsqrt(x.to(torch.float32).pow(2).mean(-1, keepdim=True) + self.eps)).to(x.dtype)
 
     def forward(self, x):
@@ -75,21 +74,13 @@ class MLASelfAttention(nn.Module):
         return torch.cos(emb), torch.sin(emb)
 
     def apply_rope(self, x, cos, sin):
-        """
-        Refactored RoPE application to be robust against backend bugs by performing
-        all calculations in float32 and casting back only once at the end.
-        """
         original_dtype = x.dtype
         device_type = x.device.type
-        
-        # For MPS, we need to be extra careful with tensor layouts
         if device_type == 'mps':
-            # Ensure input is contiguous and in a simple memory format
             x = x.contiguous().to(memory_format=torch.contiguous_format)
         else:
             x = x.contiguous()
         
-        # Promote all inputs to float32 for the calculation
         x_f = x.to(torch.float32).contiguous()
         cos_f = cos[:x_f.shape[2]].to(torch.float32).unsqueeze(0).unsqueeze(0).contiguous()
         sin_f = sin[:x_f.shape[2]].to(torch.float32).unsqueeze(0).unsqueeze(0).contiguous()
@@ -104,15 +95,13 @@ class MLASelfAttention(nn.Module):
         rotated_x = torch.stack((-x2, x1), dim=-1).contiguous()
         rotated_x = rotated_x.view(B, H, T, C).contiguous()
 
-        # Apply RoPE calculation in float32
         out_f = (x_f * cos_f) + (rotated_x * sin_f)
         out_f = out_f.contiguous()
 
         # Cast the final result back to the original dtype and ensure contiguity
         result = out_f.to(original_dtype).contiguous()
         
-        # For MPS, ensure the result has proper memory format
-        if device_type == 'mps':
+        if device_type == 'mps': 
             result = result.to(memory_format=torch.contiguous_format)
             
         return result
@@ -341,6 +330,7 @@ class GPT(nn.Module):
         # 1. Main Backbone Pass (runs once)
         tok_emb = self.transformer.wte(input_ids)
         backbone_h = self.transformer.drop(tok_emb)
+        
         for block in self.transformer.h_main:
             backbone_h, _ = block(backbone_h)
 
@@ -354,7 +344,6 @@ class GPT(nn.Module):
             current_h = backbone_h  # Start with backbone output
             
             for i, branch_blocks in enumerate(self.transformer.h_branches):
-                # Process through branch blocks
                 branch_h = current_h
                 for block in branch_blocks:
                     branch_h, _ = block(branch_h)
@@ -365,13 +354,9 @@ class GPT(nn.Module):
                 
                 # For causal chain: prepare input for next branch
                 if i < len(self.transformer.h_branches) - 1:
-                    # Get the predicted token for the current branch
-                    # Use the logits from the last position to predict next token
                     if logits.size(1) > 0:  # Check if we have valid sequence length
                         next_token_probs = F.softmax(logits[:, -1, :], dim=-1)
                         
-                        # During training, we can use the actual next token from labels
-                        # or use the predicted token. Here we'll use teacher forcing with labels
                         if i == 0:
                             # First branch predicts token at position t+1
                             if T < labels.size(1):
@@ -457,7 +442,6 @@ class GPT(nn.Module):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
     
-        # LOGIC FIX: Correctly collect all blocks from main and branches.
         all_blocks = list(self.transformer.h_main)
         for branch in self.transformer.h_branches:
             all_blocks.extend(branch)
@@ -545,7 +529,6 @@ class GPT(nn.Module):
             for block in self.transformer.h_main:
                 current_h, _ = block(current_h)
 
-            # Causal chain generation through branches
             generated_tokens = []
             
             for i, branch_blocks in enumerate(self.transformer.h_branches):

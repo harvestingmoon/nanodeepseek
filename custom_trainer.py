@@ -10,9 +10,32 @@ from datasets import load_dataset
 from mla_model import GPT, GPTConfig
 
 
-USE_MPS = True  
+# Set to True to use Apple Silicon MPS
+USE_MPS = True
 
 class MTPTrainer(Trainer):
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        Override training step to handle MPS tensor contiguity issues
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        # Force all tensors to be contiguous for MPS compatibility
+        if loss is not None and hasattr(loss, 'contiguous'):
+            loss = loss.contiguous()
+
+        # Additional MPS workaround - ensure proper memory format
+        if hasattr(loss, 'to_memory_format') and hasattr(torch, 'contiguous_format'):
+            loss = loss.to(memory_format=torch.contiguous_format)
+
+        del inputs
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        return loss.detach() / self.args.gradient_accumulation_steps
     def __init__(self, optimizer_type='muon', **kwargs):
         self.optimizer_type = optimizer_type
         super().__init__(**kwargs)
@@ -154,16 +177,14 @@ class MTPTrainer(Trainer):
         return self.optimizer
 
 if USE_MPS and torch.backends.mps.is_available():
-    print("MPS backend detected and enabled.")
-    print("WARNING: MPS backend has known compatibility issues with complex models.")
-    print("If you encounter 'channels_last format' errors, set USE_MPS = False at the top of this file.")
+    print("✅ MPS backend enabled - using Apple Silicon GPU acceleration")
     torch.set_default_device("mps")
     device = "mps"
 else:
     if USE_MPS:
-        print("MPS requested but not available, using CPU")
+        print("❌ MPS requested but not available, using CPU")
     else:
-        print("Using CPU (MPS disabled in configuration)")
+        print("🖥️ Using CPU (MPS disabled in configuration)")
     torch.set_default_device("cpu")
     device = "cpu"
 
@@ -174,7 +195,8 @@ tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 # Ensure model is on the correct device
-model = model.to(device)
+
+model.to(device)
 
 print(f"Model is on device: {next(model.parameters()).device}")
 
@@ -268,7 +290,7 @@ training_args = TrainingArguments(
     weight_decay=0.01,   
     max_grad_norm=1.0,
     remove_unused_columns=False,
-    no_cuda=True,
+   # no_cuda=True,  
     dataloader_pin_memory=False,
     
     resume_from_checkpoint="./deepseek_mtp_model/checkpoint-18360",  
