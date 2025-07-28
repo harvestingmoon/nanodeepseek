@@ -78,7 +78,7 @@ If you have any other suggestions for better datasets, do let me know
 
 Use `inference.py` , remember to load it on the different specific checkpoint that you have trained!
 
-#### Papers for reference: 
+#### Papers for reference:
 
 [Deepseek v2](https://arxiv.org/pdf/2405.04434)\
 [Deepseek v3](https://arxiv.org/abs/2412.19437)\

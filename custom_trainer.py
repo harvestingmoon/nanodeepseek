@@ -72,9 +72,9 @@ class MTPTrainer(Trainer):
                 if not param.requires_grad:
                     continue
                     
-                if "wte" in name or "embed" in name:  # Embedding parameters
+                if "wte" in name or "embed" in name:  
                     embed_params.append(param)
-                elif "lm_head" in name:  # Output head parameters
+                elif "lm_head" in name:  
                     head_params.append(param)
                 elif param.dim() < 2:  
                     scalar_params.append(param)
@@ -90,10 +90,7 @@ class MTPTrainer(Trainer):
             print(f"  Head params: {len(head_params)}")
             
             if self.optimizer_type.lower() == 'muon':
-                # Use Muon for weight matrices and AdamW for other parameters
                 param_groups = []
-                
-                # Muon group for weight matrices
                 if hidden_matrix_params:
                     param_groups.append({
                         "params": hidden_matrix_params,
@@ -124,13 +121,8 @@ class MTPTrainer(Trainer):
                     super().create_optimizer()
                 
             elif self.optimizer_type.lower() == 'muon_hybrid':
-                # Use SingleDeviceMuonWithAuxAdam for hybrid approach
                 from muon_optimizer import SingleDeviceMuonWithAuxAdam
-                
-                # Create parameter groups as per Muon recommendations
                 param_groups = []
-                
-                # Adam groups for embeddings, scalars, and heads
                 if head_params:
                     param_groups.append({
                         "params": head_params, 
@@ -177,14 +169,11 @@ class MTPTrainer(Trainer):
         return self.optimizer
 
 if USE_MPS and torch.backends.mps.is_available():
-    print("✅ MPS backend enabled - using Apple Silicon GPU acceleration")
+    print("MPS backend enabled - using Apple Silicon GPU acceleration")
     torch.set_default_device("mps")
     device = "mps"
 else:
-    if USE_MPS:
-        print("❌ MPS requested but not available, using CPU")
-    else:
-        print("🖥️ Using CPU (MPS disabled in configuration)")
+    print(" Using CPU (MPS disabled in configuration)")
     torch.set_default_device("cpu")
     device = "cpu"
 
@@ -193,8 +182,6 @@ config = GPTConfig()
 model = GPT(config)
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
-
-# Ensure model is on the correct device
 
 model.to(device)
 
@@ -205,7 +192,7 @@ print(f"Model is on device: {next(model.parameters()).device}")
 dataset = load_dataset("lmsys/lmsys-chat-1m", split="train")
 dataset_name = "lmsys-chat-1m"
 
-subset_size = 100000  # Use 100k examples for training
+subset_size = 100000  
 dataset = dataset.select(range(min(subset_size, len(dataset))))
 print(f"Using {len(dataset)} examples from {dataset_name} dataset")
 
@@ -214,7 +201,6 @@ def format_instruction_data(examples):
     
     for i in range(len(examples)):
         if dataset_name == "lmsys-chat-1m":
-            # Format for lmsys-chat-1m
             conversation = examples['conversation'][i]
             text = ""
             for turn in conversation:
@@ -243,7 +229,6 @@ def format_instruction_data(examples):
             text += f"### Instruction:\n{question}\n\n"
             text += f"### Response:\n{response}\n\n"
         
-        # Add end token
         text += tokenizer.eos_token
         formatted_texts.append(text)
     
@@ -290,9 +275,7 @@ training_args = TrainingArguments(
     weight_decay=0.01,   
     max_grad_norm=1.0,
     remove_unused_columns=False,
-   # no_cuda=True,  
     dataloader_pin_memory=False,
-    
     resume_from_checkpoint="./deepseek_mtp_model/checkpoint-18360",  
     max_steps=28360, 
     save_total_limit=5,  
@@ -303,7 +286,7 @@ training_args = TrainingArguments(
 # 4. Initialize trainer for continued training
 print("Setting up trainer for continued training...")
 trainer = MTPTrainer(
-    optimizer_type='adamw',  # Use AdamW for reliable training
+    optimizer_type='adamw', 
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,

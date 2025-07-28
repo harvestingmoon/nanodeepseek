@@ -337,7 +337,6 @@ class GPT(nn.Module):
         all_logits = []
         loss = None
 
-        # This block handles both training (if labels is not None) and inference
         if labels is not None:
             # 2. Causal Chain Branch Pass for Training
             # Each branch uses the output from the previous branch as input
@@ -374,21 +373,16 @@ class GPT(nn.Module):
                         
                         # Create embedding for the next token and add it to the sequence
                         next_token_emb = self.transformer.wte(next_token_ids)
-                        
-                        # Update current_h for the next branch
-                        # Concatenate the new token embedding to the sequence
                         current_h = torch.cat([branch_h, next_token_emb], dim=1)
                         
                         # Trim if sequence becomes too long
                         if current_h.size(1) > self.config.block_size:
                             current_h = current_h[:, -self.config.block_size:, :]
                     else:
-                        # If logits is empty, just pass the current hidden state
                         current_h = branch_h
 
             # 3. Calculate Loss (unchanged from original)
             if all_logits:
-                # Create total_loss tensor on the same device as the model
                 device = input_ids.device
                 total_loss = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
                 loss_token_offset = 1

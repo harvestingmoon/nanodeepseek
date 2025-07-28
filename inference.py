@@ -156,31 +156,11 @@ def main():
     
     print(" DeepSeekNano Model Inference")
     print("=" * 40)
-    
-    # Load the trained model
     model, tokenizer = load_trained_model()
     
     if model is None or tokenizer is None:
         print(" Failed to load model. Please check the model path.")
         return
-    
-    test_prompts = [
-        "The future of artificial intelligence",
-        "In a world where",
-        "Scientists recently discovered",
-        "The most important thing in life is"
-    ]
-    
-    print("\n Testing with example prompts:")
-    print("-" * 40)
-    
-    for prompt in test_prompts:
-        print(f"\n Prompt: '{prompt}'")
-        generated = generate_text(model, tokenizer, prompt, max_length=50, temperature=0.7)
-        response = generated[len(prompt):].strip()
-        print(f" Generated: {response}")
-    
-    # Start interactive mode
     interactive_chat(model, tokenizer)
 
 if __name__ == "__main__":
