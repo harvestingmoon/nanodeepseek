@@ -1,41 +1,62 @@
 ## A heavily modified NanoGPT 
 
 ### Motivation:
-This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers & other relative research papers into a small simple and concise LLM (that is basically NanoGPT). It is a small trained implementation of Deepseek (190m params) with a Muon Optimizer & several novel research ideas
-
-### General Architecture
-![alt text](image.png)
-
-Right now, I have implemented 3 MTP Blocks (1 Main module and 2 MTP Modules). The main module contains 8 Layers of Transformer block while each of the remaining MTP modules only contains 2 layers of transformer block (albeit they put only 1 there -> possibly because most of the context and space representation is already done in the main module)
-
-
-
-![alt](image-1.png)
-
-Each transformer block basically contains RMSNorm with the attention being MLA. Yes it contians the K/V Cache compression algorithm and decoupled RoPe in place too. This then concats with the previous value before undergoing RMSNorm again to a FFN that is DeepSeekMoE. 
-
-DeepSeekMoE was a little more complex as I thought since it contains fine grained experts segmentations, shared expert iso and a modified aux load balancer for even distribution between experts.
-
-In the future, I am also implementing MoBA for long context windows (as proposed by the Kimi research paper)
-
-
+This repo basically serves as a way to see how I can implement the novel mechanisms as shown in DeepSeek Papers & other relative research papers into a small simple and concise LLM (that is basically NanoGPT). It is a small trained implementation of Deepseek (190m params) with a MuonClip Optimizer
 
 ### TODO:
-- Muon Optimizer Bug (where it is unable to iterate at first epoch, for now just stick to AdamW)
+
+- Draw unified diagram for README.md
 
 - CUDA support (for now has CPU & MTS support)
 
 - GRPO (r1) (via GRPOTrainer class) 
 
-- MoBA (Mixture of Block Attn module) for long context LLMs
-
 - FP8/BF16/BF32 Mixed Precision Training 
 
 - Dualpipe Parallelism (well probably requires some CUDA understand)
 
+### General Architecture
+
+![image](image.png)
+
+
+The model consists of a main backbone containing 8 layers of transformer blocks. This main module is followed by two MTP branches, each with 2 additional transformer layers. During training, these branches operate in a causal chain, where the output of the main module and previous branches is used as input for subsequent branches to predict future tokens
+
+### Components:
+
+
+
+
+#### Attention:
+
+![image-transformer](image-transformer.png)
+
+The attention mechanism is built on three core components. It begins with Multi-Latent Attention (MLA), a projection scheme that generates latent query and key representations. Integrated within this MLA process is a Decoupled RoPE strategy, which splits these representations into position-aware and content-aware channels for more expressive power. 
+
+![moba](moba.png)
+
+
+
+Finally, these specialized vectors are processed by Mixture of Block Attention (MoBA), which performs the final efficient and sparse attention calculation. This is located within the Multi-Head Attention block above
+
+
+
+#### FFN:
+For its feed-forward layers, the model employs DeepSeekMoe, a Mixture of Experts (MoE) architecture by the Deepseek. This replaces the standard FFN with a collection of smaller "expert" networks, and a dynamic router selects which experts process each token. To ensure these experts are used efficiently during training, the model incorporates a crucial auxiliary loss. This loss term acts as a load balancer, incentivizing the router to distribute tokens evenly across all experts, which allows the model to scale its parameter count effectively while keeping the computational cost per token constant
+
+
+### Optimizer:
+
+![muon-clip](muonclip.png)
+
+This model is then trained on MuonClip, a modified Muon Optimizer that was used to train Kimi K2.
+
+
 
 ### Items Implemented (Just a List Checker): 
 - Multi Latent Attention (K/V cache compression algo and deCoupled RoPe in place)
+
+- MoBA (Mixture of Block Attn module) for long context LLMs
 
 - DeepSeekMoE (with fine grained expert segmentation, shared expert isolation and a modified auxillary load balacer)
 

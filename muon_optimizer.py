@@ -24,11 +24,9 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     # Ensure spectral norm is at most 1
     norm_val = X.norm(dim=(-2, -1), keepdim=True) + eps
     X = (X / norm_val).contiguous()
-    
-    # Perform the NS iterations with explicit device management
+
     for _ in range(steps):
         A = (X @ X.mT).contiguous()
-        # Ensure all operations are on the same device
         A = A.to(device)
         A_squared = (A @ A).contiguous()
         B = (b * A + c * A_squared).contiguous()
@@ -48,6 +46,21 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     update = update.contiguous()
+
+
+def muon_clip_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True, use_rms_scaling=True):
+    """
+    MuonClip update function that implements the algorithm from Kimi K2.
+    This includes RMS scaling factor matching Adam RMS: sqrt(max(n,m)) * 0.2
+    """
+    # Ensure all tensors are on the same device and contiguous
+    device = grad.device
+    grad = grad.contiguous()
+    momentum = momentum.contiguous()
+    
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    update = update.contiguous()
     
     # Handle convolutional filters
     if update.ndim == 4: # for the case of conv filters
@@ -55,14 +68,17 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     
     # Ensure update is 2D for Newton-Schulz
     if update.ndim == 1:
-        return update  # Skip Newton-Schulz for 1D tensors (biases, etc.)
+        return update  
     
     # Apply Newton-Schulz orthogonalization
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    
-    # Scale by the dimension ratio
-    scale_factor = max(1, grad.size(-2) / grad.size(-1))**0.5
-    update = update * scale_factor
+    if use_rms_scaling:
+        n, m = update.size(-2), update.size(-1)
+        rms_scale_factor = (max(n, m) ** 0.5) * 0.2
+        update = update * rms_scale_factor
+    else:
+        scale_factor = max(1, grad.size(-2) / grad.size(-1))**0.5
+        update = update * scale_factor
     
     return update.to(device)
 
@@ -162,6 +178,168 @@ class SingleDeviceMuon(torch.optim.Optimizer):
                 p.add_(update.reshape(p.shape), alpha=-group["lr"])
 
         return loss
+
+
+class MuonClip(torch.optim.Optimizer):
+    """
+    MuonClip - Muon optimizer with QK-Clip as implemented in Kimi K2
+    
+    This combines:
+    1. Muon optimizer step with RMS scaling: sqrt(max(n,m)) * 0.2
+    2. QK-Clip: gradient clipping for attention weights based on softmax max values
+    
+    Arguments:
+        lr: The learning rate, in units of spectral norm per update.
+        weight_decay: The AdamW-style weight decay.
+        momentum: The momentum. A value of 0.95 here is usually fine.
+        qk_clip_threshold: Threshold τ for QK-Clip (default: 100.0)
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, qk_clip_threshold=100.0):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, qk_clip_threshold=qk_clip_threshold)
+        super().__init__(params, defaults)
+        
+        # Store attention softmax max values for QK-Clip
+        self.attention_max_values = {}
+
+    def register_attention_max(self, layer_name, head_idx, softmax_max_val):
+        """Register the max softmax value for QK-Clip"""
+        key = f"{layer_name}_head_{head_idx}"
+        self.attention_max_values[key] = softmax_max_val
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                
+                # Apply QK-Clip if this is an attention parameter
+                grad = p.grad
+                param_name = getattr(p, '_param_name', '')
+                
+                if any(name in param_name.lower() for name in ['q_proj', 'k_proj', 'query', 'key']):
+                    grad = self._apply_qk_clip(grad, param_name, group["qk_clip_threshold"])
+                
+                # Apply MuonClip update (Muon with RMS scaling)
+                if grad.ndim >= 2:
+                    update = muon_clip_update(grad, state["momentum_buffer"], beta=group["momentum"])
+                else:
+                    # For 1D parameters, just use momentum
+                    state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+                    update = state["momentum_buffer"]
+                
+                # Apply weight decay and learning rate
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+        return loss
+    
+    def _apply_qk_clip(self, grad, param_name, threshold):
+        """Apply QK-Clip based on stored attention max values"""
+        # Try to find corresponding attention max value
+        for key, max_val in self.attention_max_values.items():
+            if any(name in param_name.lower() for name in key.split('_')):
+                if max_val > threshold:
+                    # Compute clipping factor: γ = τ / S_max^h
+                    gamma = threshold / max_val
+                    sqrt_gamma = torch.sqrt(torch.tensor(gamma, device=grad.device))
+                    grad = grad * sqrt_gamma
+                break
+        
+        return grad
+
+
+class SingleDeviceMuonClip(torch.optim.Optimizer):
+    """
+    Non-distributed variant of MuonClip for single device usage.
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, qk_clip_threshold=100.0):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, qk_clip_threshold=qk_clip_threshold)
+        super().__init__(params, defaults)
+        
+        # Store attention softmax max values for QK-Clip  
+        self.attention_max_values = {}
+
+    def register_attention_max(self, layer_name, head_idx, softmax_max_val):
+        """Register the max softmax value for QK-Clip"""
+        key = f"{layer_name}_head_{head_idx}"
+        self.attention_max_values[key] = softmax_max_val
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                
+                # Ensure grad is on the same device as parameter
+                if p.grad.device != p.device:
+                    p.grad = p.grad.to(p.device)
+                
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p, device=p.device)
+                
+                # Apply QK-Clip if this is an attention parameter
+                grad = p.grad
+                param_name = getattr(p, '_param_name', '')
+                
+                if any(name in param_name.lower() for name in ['q_proj', 'k_proj', 'query', 'key']):
+                    grad = self._apply_qk_clip(grad, param_name, group["qk_clip_threshold"])
+                
+                # Apply MuonClip update
+                if grad.ndim >= 2:
+                    update = muon_clip_update(grad, state["momentum_buffer"], beta=group["momentum"])
+                    # Handle reshape carefully
+                    if update.shape != p.shape:
+                        if update.numel() == p.numel():
+                            update = update.reshape(p.shape)
+                        else:
+                            # Fallback: use original gradient
+                            update = grad
+                else:
+                    # For 1D parameters (biases), just use momentum
+                    state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+                    update = state["momentum_buffer"]
+                
+                # Ensure update is on correct device and has correct shape
+                update = update.to(p.device)
+                if update.shape != p.shape:
+                    update = update.reshape(p.shape)
+                
+                # Apply weight decay and learning rate
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update, alpha=-group["lr"])
+
+        return loss
+    
+    def _apply_qk_clip(self, grad, param_name, threshold):
+        """Apply QK-Clip based on stored attention max values"""
+        # Try to find corresponding attention max value
+        for key, max_val in self.attention_max_values.items():
+            if any(name in param_name.lower() for name in key.split('_')):
+                if max_val > threshold:
+                    # Compute clipping factor: γ = τ / S_max^h  
+                    gamma = threshold / max_val
+                    sqrt_gamma = torch.sqrt(torch.tensor(gamma, device=grad.device))
+                    grad = grad * sqrt_gamma
+                break
+        
+        return grad
 
 
 def adam_update(grad, buf1, buf2, step, betas, eps):
@@ -270,7 +448,6 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0)
                 assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
             else:
-                # defaults
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
@@ -292,7 +469,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     if p.grad is None:
                         continue
                     
-                    # Ensure grad is on the same device as parameter
+                    
                     if p.grad.device != p.device:
                         p.grad = p.grad.to(p.device)
                     
@@ -300,7 +477,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p, device=p.device)
                     
-                    # Only apply Muon to 2D+ parameters (matrices)
+                    
                     if p.grad.ndim >= 2:
                         update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
                         # Handle reshape carefully

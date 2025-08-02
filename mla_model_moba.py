@@ -1,8 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-Really it is a GPT Model but with DeepSeek modifications.
-
-"""
 
 import math
 import inspect
@@ -10,6 +5,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import sys
+import os
+from moba import register_moba, MoBAConfig
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+MOBA_AVAILABLE = True
+
 
 class RMSNorm(nn.Module):
     def __init__(self, ndim, eps: float = 1e-5):
@@ -27,7 +28,7 @@ class RMSNorm(nn.Module):
         output = self._norm(x)
         return output * self.weight
 
-class MLASelfAttention(nn.Module):
+class MLASelfAttentionWithMoBA(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -42,6 +43,12 @@ class MLASelfAttention(nn.Module):
         self.d_head_c = self.d_head // 2 # "Context" part, plain
         
         self.dropout = config.dropout
+        
+        # MoBA configuration
+        self.attn_implementation = getattr(config, 'attn_implementation', 'flash_attention_2')
+        self.use_moba = 'moba' in self.attn_implementation if hasattr(config, 'attn_implementation') else False
+        
+        # Standard MLA projections
         self.q_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
         self.k_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
         self.v_down_proj = nn.Linear(self.n_embd, self.n_head * self.d_latent, bias=config.bias)
@@ -58,87 +65,19 @@ class MLASelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.attn_dropout = nn.Dropout(config.dropout)
 
-        # Store attention implementation config
-        self.attn_implementation = getattr(config, 'attn_implementation', 'flash_attention_2')
-        self.use_moba = getattr(config, 'use_moba', False)
-
         self.rope_cache = self.precompute_rope_cache(self.d_head_e, config.block_size)
         
+        # Attention backend selection
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        
+        if self.use_moba and MOBA_AVAILABLE:
+            print(f"✓ Using MoBA attention: {self.attn_implementation}")
+        elif self.flash:
+            print("✓ Using Flash Attention")
+        else:
+            print("⚠️  Using manual attention implementation")
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-        
-        # Initialize MoBA if requested
-        if self.use_moba:
-            self._init_moba(config)
-
-    def _init_moba(self, config):
-        """Initialize MoBA attention"""
-        try:
-            import sys
-            import os
-            
-            # Add MoBA to path if available
-            moba_path = os.path.join(os.path.dirname(__file__), 'MoBA')
-            if os.path.exists(moba_path) and moba_path not in sys.path:
-                sys.path.insert(0, moba_path)
-            
-            from moba import register_moba, MoBAConfig
-            
-            # Register MoBA with configuration
-            moba_config = MoBAConfig(
-                moba_chunk_size=getattr(config, 'moba_chunk_size', 4096),
-                moba_topk=getattr(config, 'moba_topk', 12)
-            )
-            register_moba(moba_config)
-            
-            print(f"✓ MoBA initialized with chunk_size={moba_config.moba_chunk_size}, topk={moba_config.moba_topk}")
-            self.moba_available = True
-            
-        except ImportError as e:
-            print(f"⚠️  MoBA not available: {e}")
-            print("   Falling back to Flash Attention")
-            self.use_moba = False
-            self.moba_available = False
-
-    def _moba_attention(self, q, k, v):
-        """Apply MoBA attention"""
-        try:
-            # Get MoBA attention function from transformers registry
-            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-            
-            if self.attn_implementation in ALL_ATTENTION_FUNCTIONS:
-                moba_fn = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
-                y = moba_fn(
-                    q, k, v, 
-                    attention_mask=None, 
-                    dropout_p=self.dropout if self.training else 0,
-                    is_causal=True
-                )
-            else:
-                # Fallback to direct MoBA call if available
-                print(f"⚠️  MoBA function '{self.attn_implementation}' not found in transformers registry")
-                print("   Falling back to Flash Attention")
-                y = F.scaled_dot_product_attention(
-                    q, k, v, 
-                    attn_mask=None, 
-                    dropout_p=self.dropout if self.training else 0, 
-                    is_causal=True
-                )
-                
-        except Exception as e:
-            print(f"⚠️  MoBA attention failed: {e}")
-            print("   Falling back to Flash Attention")
-            y = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=None, 
-                dropout_p=self.dropout if self.training else 0, 
-                is_causal=True
-            )
-        
-        return y
 
     def precompute_rope_cache(self, dim, max_seq_len, theta=10000.0):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
@@ -190,6 +129,7 @@ class MLASelfAttention(nn.Module):
         else:
             x = x.contiguous()
 
+        # MLA attention computation (same as original)
         q_latent = self.q_down_proj(x).view(B, T, self.n_head, self.d_latent).contiguous()
         k_latent_new = self.k_down_proj(x).view(B, T, self.n_head, self.d_latent).contiguous()
         v_latent_new = self.v_down_proj(x).view(B, T, self.n_head, self.d_latent).contiguous()
@@ -220,13 +160,28 @@ class MLASelfAttention(nn.Module):
         q = torch.cat([q_c, q_e_rope], dim=-1).contiguous()
         k = torch.cat([k_c, k_e_rope], dim=-1).contiguous()
 
-        # Choose attention implementation
-        if self.use_moba and hasattr(self, 'moba_available') and self.moba_available:
+        # Attention computation with MoBA support
+        if self.use_moba and MOBA_AVAILABLE and self.attn_implementation in ALL_ATTENTION_FUNCTIONS:
             # Use MoBA attention
-            y = self._moba_attention(q, k, v)
+            moba_fn = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
+            y = moba_fn(
+                query=q,
+                key=k, 
+                value=v,
+                attention_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
         elif self.flash:
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # Use Flash Attention
+            y = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None, 
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=True
+            )
         else:
+            # Manual attention computation
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
@@ -242,6 +197,9 @@ class MLASelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         
         return y, present_kv
+
+# Alias for backward compatibility
+MLASelfAttention = MLASelfAttentionWithMoBA
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -355,8 +313,7 @@ class GPTConfig:
     bias_update_gamma: float = 1e-2
     
     # MoBA configuration
-    attn_implementation: str = "flash_attention_2"  # Options: "flash_attention_2", "moba", "moba_naive"
-    use_moba: bool = False
+    attn_implementation: str = "moba"  # Can be "flash_attention_2", "moba", "moba_naive"
     moba_chunk_size: int = 4096
     moba_topk: int = 12
 
@@ -368,12 +325,27 @@ class GPTConfig:
     def n_predicted_tokens(self):
         return sum(self.n_tokens_per_branch)
 
+def setup_moba(config):
+    """Setup MoBA if requested and available"""
+    if MOBA_AVAILABLE and 'moba' in config.attn_implementation:
+        moba_config = MoBAConfig(
+            moba_chunk_size=config.moba_chunk_size,
+            moba_topk=config.moba_topk
+        )
+        register_moba(moba_config)
+        print(f"✓ MoBA registered with chunk_size={config.moba_chunk_size}, topk={config.moba_topk}")
+        return True
+    return False
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+
+        # Setup MoBA if requested
+        setup_moba(config)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -406,8 +378,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-
     def forward(self, input_ids, labels=None):
+        # Same forward implementation as original
         B, T = input_ids.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
 
@@ -422,9 +394,8 @@ class GPT(nn.Module):
         loss = None
 
         if labels is not None:
-            # 2. Causal Chain Branch Pass for Training
-            # Each branch uses the output from the previous branch as input
-            current_h = backbone_h  # Start with backbone output
+            # Training mode - same as original implementation
+            current_h = backbone_h
             
             for i, branch_blocks in enumerate(self.transformer.h_branches):
                 branch_h = current_h
@@ -435,37 +406,31 @@ class GPT(nn.Module):
                 logits = self.lm_heads[i](final_h)
                 all_logits.append(logits)
                 
-                # For causal chain: prepare input for next branch
                 if i < len(self.transformer.h_branches) - 1:
-                    if logits.size(1) > 0:  # Check if we have valid sequence length
+                    if logits.size(1) > 0:
                         next_token_probs = F.softmax(logits[:, -1, :], dim=-1)
                         
                         if i == 0:
-                            # First branch predicts token at position t+1
                             if T < labels.size(1):
-                                next_token_ids = labels[:, T:T+1]  # Use actual next token
+                                next_token_ids = labels[:, T:T+1]
                             else:
-                                # If we don't have the next token, sample from predictions
                                 next_token_ids = torch.multinomial(next_token_probs, num_samples=1)
                         else:
-                            # Subsequent branches predict further ahead
                             token_offset = i + 1
                             if T + token_offset < labels.size(1):
                                 next_token_ids = labels[:, T + token_offset:T + token_offset + 1]
                             else:
                                 next_token_ids = torch.multinomial(next_token_probs, num_samples=1)
                         
-                        # Create embedding for the next token and add it to the sequence
                         next_token_emb = self.transformer.wte(next_token_ids)
                         current_h = torch.cat([branch_h, next_token_emb], dim=1)
                         
-                        # Trim if sequence becomes too long
                         if current_h.size(1) > self.config.block_size:
                             current_h = current_h[:, -self.config.block_size:, :]
                     else:
                         current_h = branch_h
 
-            # 3. Calculate Loss (unchanged from original)
+            # Calculate loss (same as original)
             if all_logits:
                 device = input_ids.device
                 total_loss = torch.tensor(0.0, dtype=torch.float32, requires_grad=True, device=device)
@@ -475,12 +440,10 @@ class GPT(nn.Module):
                     num_predicted = self.config.n_tokens_per_branch[i]
                     for j in range(num_predicted):
                         current_offset = loss_token_offset + j
-                        # Slice logits and labels to align them for prediction
                         current_logits = branch_logits[:, :-current_offset, :].contiguous()
                         current_targets = labels[:, current_offset:].contiguous()
                         
                         if current_logits.size(1) > 0 and current_targets.size(1) > 0:
-                            # Ensure both tensors have the same sequence length
                             min_len = min(current_logits.size(1), current_targets.size(1))
                             current_logits = current_logits[:, :min_len, :]
                             current_targets = current_targets[:, :min_len]
@@ -488,7 +451,7 @@ class GPT(nn.Module):
                             l = F.cross_entropy(
                                 current_logits.reshape(-1, current_logits.size(-1)),
                                 current_targets.reshape(-1),
-                                ignore_index=-100  # Properly ignore padding tokens
+                                ignore_index=-100
                             )
                             total_loss = total_loss + l
                     loss_token_offset += num_predicted
@@ -506,16 +469,14 @@ class GPT(nn.Module):
                 final_h = self.transformer.ln_f(branch_h)
                 logits = self.lm_heads[i](final_h)
                 
-                # For the first branch, just return the logits
                 if i == 0:
                     final_logits = logits
                 
-                # For subsequent branches in inference, we would continue the chain
-                # but for simplicity, we'll just use the first branch's output
                 break
 
         return final_logits, loss
-    
+
+    # Rest of the methods remain the same as original
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
@@ -525,7 +486,6 @@ class GPT(nn.Module):
             all_blocks.extend(branch)
 
         for block in all_blocks:
-            # LOGIC FIX: Use the correct dimension for RoPE part (`d_head_e`).
             block.attn.rope_cache = block.attn.precompute_rope_cache(
                 dim=block.attn.d_head_e,
                 max_seq_len=self.config.block_size
@@ -533,75 +493,12 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type='muon'):
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        if optimizer_type.lower() == 'muon':
-            # Import Muon optimizer
-            from muon_optimizer import Muon
-            
-            all_params = decay_params + nodecay_params
-            optimizer = Muon(
-                all_params, 
-                lr=learning_rate, 
-                momentum=0.95,  # Typical Muon momentum
-                nesterov=True
-            )
-            print(f"using Muon optimizer with lr={learning_rate}")
-            
-        elif optimizer_type.lower() == 'muon_hybrid':
-            from muon_optimizer import MuonAdamHybrid
-            # Use hybrid approach: Muon for weights, Adam for biases/norms
-            all_params = decay_params + nodecay_params
-            optimizer = MuonAdamHybrid(
-                all_params,
-                lr=learning_rate * 0.1,  # Lower Adam LR
-                muon_lr=learning_rate,   # Higher Muon LR
-                muon_momentum=0.95,
-                weight_decay=weight_decay,
-                use_muon_for_weights=True
-            )
-            print(f"using Muon+Adam hybrid optimizer with muon_lr={learning_rate}, adam_lr={learning_rate * 0.1}")
-            
-        else:
-            optim_groups = [
-                {'params': decay_params, 'weight_decay': weight_decay},
-                {'params': nodecay_params, 'weight_decay': 0.0}
-            ]
-            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and device_type == 'cuda'
-            extra_args = dict(fused=True) if use_fused else dict()
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-            print(f"using fused AdamW: {use_fused}")
-            
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        flops_achieved = flops_per_iter * (1.0/dt)
-        flops_promised = 12.74e12 
-        mfu = flops_achieved / flops_promised
-        return mfu
-
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         self.eval()
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
-            # Main backbone processing
             tok_emb = self.transformer.wte(idx_cond)
             current_h = self.transformer.drop(tok_emb)
             for block in self.transformer.h_main:
@@ -610,15 +507,13 @@ class GPT(nn.Module):
             generated_tokens = []
             
             for i, branch_blocks in enumerate(self.transformer.h_branches):
-                # Process through current branch
                 branch_h = current_h
                 for block in branch_blocks:
                     branch_h, _ = block(branch_h)
                 
                 final_h = self.transformer.ln_f(branch_h)
-                logits = self.lm_heads[i](final_h[:, -1, :])  # Only use last position
+                logits = self.lm_heads[i](final_h[:, -1, :])
                 
-                # Apply temperature and top-k filtering
                 logits = logits / temperature
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -628,13 +523,10 @@ class GPT(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
                 generated_tokens.append(idx_next)
                 
-                # For the causal chain: prepare input for next branch
                 if i < len(self.transformer.h_branches) - 1:
-                    # Add the generated token to the sequence for the next branch
                     next_token_emb = self.transformer.wte(idx_next)
                     current_h = torch.cat([branch_h, next_token_emb], dim=1)
                     
-                    # Trim if sequence becomes too long
                     if current_h.size(1) > self.config.block_size:
                         current_h = current_h[:, -self.config.block_size:, :]
 
@@ -642,5 +534,4 @@ class GPT(nn.Module):
                 idx = torch.cat((idx, token), dim=1)
                 break
 
-        self.train()
         return idx
