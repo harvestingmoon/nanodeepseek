@@ -5,8 +5,6 @@ This repo basically serves as a way to see how I can implement the novel mechani
 
 ### TODO:
 
-- Draw unified diagram for README.md
-
 - CUDA support (for now has CPU & MTS support)
 
 - GRPO (r1) (via GRPOTrainer class) 
@@ -17,8 +15,7 @@ This repo basically serves as a way to see how I can implement the novel mechani
 
 ### General Architecture
 
-![image](image.png)
-
+![image](assets/model.png)
 
 The model consists of a main backbone containing 8 layers of transformer blocks. This main module is followed by two MTP branches, each with 2 additional transformer layers. During training, these branches operate in a causal chain, where the output of the main module and previous branches is used as input for subsequent branches to predict future tokens
 
@@ -29,14 +26,7 @@ The model consists of a main backbone containing 8 layers of transformer blocks.
 
 #### Attention:
 
-![image-transformer](image-transformer.png)
-
 The attention mechanism is built on three core components. It begins with Multi-Latent Attention (MLA), a projection scheme that generates latent query and key representations. Integrated within this MLA process is a Decoupled RoPE strategy, which splits these representations into position-aware and content-aware channels for more expressive power. 
-
-![moba](moba.png)
-
-
-
 Finally, these specialized vectors are processed by Mixture of Block Attention (MoBA), which performs the final efficient and sparse attention calculation. This is located within the Multi-Head Attention block above
 
 
@@ -47,7 +37,7 @@ For its feed-forward layers, the model employs DeepSeekMoe, a Mixture of Experts
 
 ### Optimizer:
 
-![muon-clip](muonclip.png)
+![muon-clip](assets/muonclip.png)
 
 This model is then trained on MuonClip, a modified Muon Optimizer that was used to train Kimi K2.
 

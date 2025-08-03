@@ -7,7 +7,7 @@ from transformers import (
     DataCollatorForLanguageModeling
 )
 from datasets import load_dataset
-from mla_model_moba import GPT, GPTConfig
+from mla_model import GPT, GPTConfig
 
 
 USE_MPS = True
@@ -62,61 +62,144 @@ class MTPTrainer(Trainer):
             print(f"  Forward pass: {(forward_time - data_prep_time)*1000:.1f}ms") 
             print(f"  Cleanup: {(cleanup_time - forward_time)*1000:.1f}ms")
             print(f"  Total: {(cleanup_time - step_start)*1000:.1f}ms")
+            print(f"  Loss value: {loss.item():.6f}")
+            print(f"  Loss requires_grad: {loss.requires_grad}")
 
         return loss.detach() / self.args.gradient_accumulation_steps
     
-    def __init__(self, optimizer_type='muon', starting_step=0, **kwargs):
+    def __init__(self, optimizer_type='muon', starting_step=0, load_optimizer_state=False, **kwargs):
         self.optimizer_type = optimizer_type
         self.starting_step = starting_step
+        self.load_optimizer_state = load_optimizer_state
         super().__init__(**kwargs)
     
     def _setup_starting_step(self, starting_step):
         """Set the starting step for continued training"""
         self.state.global_step = starting_step
         self.state.epoch = 0
-        self.state.max_steps = self.args.max_steps
+        self.state.max_steps = self.args.max_steps 
+        total_samples_processed = starting_step * self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps
+        
         print(f"Set starting step to {starting_step}")
+        print(f"Total samples already processed: {total_samples_processed}")
+        print(f"Remaining steps: {self.args.max_steps - starting_step}")
+    
+    def _validate_checkpoint(self, checkpoint_dir):
+        """Validate that checkpoint directory contains necessary files"""
+        import os
+        
+        required_files = [
+            "model.safetensors", 
+            "trainer_state.json",
+            "training_args.bin"
+        ]
+        
+        missing_files = []
+        for file in required_files:
+            if not os.path.exists(os.path.join(checkpoint_dir, file)):
+                missing_files.append(file)
+        
+        if missing_files:
+            print(f"Warning: Missing checkpoint files: {missing_files}")
+            return False
+        
+        return True
     
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):
         """Override train to handle manual checkpoint continuation"""
-        if self.starting_step > 0:
-            self._setup_starting_step(self.starting_step)
+        import os
         
-        return super().train(
+        # If we have a starting step > 0, we need to set up checkpoint resumption
+        if self.starting_step > 0 and resume_from_checkpoint is None:
+            checkpoint_dir = f"./deepseek_mtp_model/checkpoint-{self.starting_step}"
+            if os.path.exists(checkpoint_dir) and self._validate_checkpoint(checkpoint_dir):
+                print(f"Auto-resuming from checkpoint: {checkpoint_dir}")
+                resume_from_checkpoint = checkpoint_dir
+            else:
+                print(f"Warning: Checkpoint directory {checkpoint_dir} not found or incomplete, setting manual step")
+                self._setup_starting_step(self.starting_step)
+        
+        # Ensure model parameters are still trainable after checkpoint loading
+        result = super().train(
             resume_from_checkpoint=resume_from_checkpoint, 
             trial=trial, 
             ignore_keys_for_eval=ignore_keys_for_eval,
             **kwargs
         )
+        
+        return result
     
-    def _load_from_checkpoint(self, resume_from_checkpoint):
-        if resume_from_checkpoint is None:
+    def optimizer_step(self, optimizer):
+        """Override optimizer step to check gradients after backward pass"""
+        # Use the actual global step instead of our internal counter
+        global_step = self.state.global_step if hasattr(self, 'state') else 0
+        
+        # Check gradient norms after backward pass but before optimizer step
+        if global_step % 50 == 0:
+            total_norm = 0.0
+            param_count = 0
+            max_grad = 0.0
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    max_grad = max(max_grad, param_norm.item())
+                    param_count += 1
+            total_norm = total_norm ** (1. / 2)
+            
+            print(f"  [STEP {global_step}] Grad norm after backward: {total_norm:.6f}")
+            print(f"  [STEP {global_step}] Params with gradients: {param_count}")
+            print(f"  [STEP {global_step}] Max gradient norm: {max_grad:.6f}")
+            
+            if param_count == 0:
+                print(f"  [STEP {global_step}] WARNING: No gradients found! Checking first few parameters:")
+                for i, (name, param) in enumerate(self.model.named_parameters()):
+                    if i < 5:  # Check first 5 parameters
+                        print(f"    {name}: requires_grad={param.requires_grad}, grad={param.grad is not None}")
+            else:
+                print(f"  [STEP {global_step}] ✅ Gradients are flowing properly!")
+        
+        # Call the original optimizer step
+        return super().optimizer_step(optimizer)
+    
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        """Override to handle optimizer state loading more carefully (this is a current fallback)"""
+        if checkpoint is None:
             return
-        import os
-        import json
         
-        checkpoint_path = resume_from_checkpoint
-        
-        # Try to load trainer state to get the step number
-        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
-        if os.path.exists(trainer_state_path):
-            with open(trainer_state_path, 'r') as f:
-                trainer_state = json.load(f)
-                self.starting_step = trainer_state.get('global_step', 0)
-                print(f"Found checkpoint at step {self.starting_step}")
-        
-        # Load model weights
-        model_path = os.path.join(checkpoint_path, "model.safetensors")
-        if os.path.exists(model_path):
+        if self.load_optimizer_state:
             try:
-                from safetensors.torch import load_file
-                state_dict = load_file(model_path)
-                self.model.load_state_dict(state_dict, strict=False)
-                print(f"Model weights loaded from {model_path}")
+                super()._load_optimizer_and_scheduler(checkpoint)
+                print("Successfully loaded optimizer and scheduler state from checkpoint")
+            except (ValueError, RuntimeError) as e:
+                print(f"Warning: Could not load optimizer state: {e}")
+                print("Continuing with fresh optimizer state...")
+                try:
+                    if self.lr_scheduler is not None and "lr_scheduler" in checkpoint:
+                        self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+                        print("Loaded scheduler state")
+                except Exception as e2:
+                    print(f"Could not load scheduler state: {e2}")
+        else:
+            print("Skipping optimizer state loading (load_optimizer_state=False)")
+            try:
+                if self.lr_scheduler is not None and "lr_scheduler" in checkpoint:
+                    self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+                    print("Loaded scheduler state")
             except Exception as e:
-                print(f"Could not load model weights: {e}")
+                print(f"Could not load scheduler state: {e}")
         
-        # Skip optimizer and scheduler loading - let them initialize fresh
+
+        frozen_count = 0
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                param.requires_grad = True
+                frozen_count += 1
+        
+        if frozen_count > 0:
+            print(f"WARNING: Re-enabled gradients for {frozen_count} parameters that were frozen after checkpoint loading")
+    
+
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         input_ids = inputs.get("input_ids")
@@ -127,6 +210,9 @@ class MTPTrainer(Trainer):
         if labels is not None:
             labels = labels.long()
             
+        # Ensure model is in training mode
+        model.train()
+        
         model_inputs = {
             "input_ids": input_ids,
             "labels": labels,
@@ -210,7 +296,7 @@ class MTPTrainer(Trainer):
                         "lr": self.args.learning_rate,
                         "momentum": 0.95,
                         "weight_decay": self.args.weight_decay,
-                        "qk_clip_threshold": 100.0,  # Default QK-Clip threshold
+                        "qk_clip_threshold": 1000.0,  # Increased from 100.0 to 1000.0
                         "use_muon": True
                     })
                 
@@ -287,7 +373,7 @@ if USE_MPS and torch.backends.mps.is_available():
     device = "mps"
     
     # Additional MPS optimizations
-    torch.mps.empty_cache()  # Clear MPS cache
+    torch.mps.empty_cache()  
     print(f"MPS is available: {torch.backends.mps.is_available()}")
     print(f"MPS is built: {torch.backends.mps.is_built()}")
 else:
@@ -300,25 +386,17 @@ config = GPTConfig()
 model = GPT(config)
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
-checkpoint_path = "./deepseek_mtp_model/checkpoint-22000/model.safetensors"
-print(f"Loading model weights from {checkpoint_path}")
 
-try:
-    from safetensors.torch import load_file
-    state_dict = load_file(checkpoint_path)
-    model.load_state_dict(state_dict, strict=False)
-    print("Model weights loaded successfully from checkpoint-22000")
-except Exception as e:
-    print(f" Could not load from safetensors: {e}")
-    print("Trying to load from pytorch checkpoint...")
-    try:
-        import torch
-        checkpoint = torch.load("./deepseek_mtp_model/checkpoint-22000/pytorch_model.bin", map_location="cpu")
-        model.load_state_dict(checkpoint, strict=False)
-        print("Model weights loaded successfully from pytorch checkpoint")
-    except Exception as e2:
-        print(f" Could not load checkpoint: {e2}")
-        print("Starting with random initialization")
+# Note: Model weights will be loaded automatically from checkpoint during training resumption
+print("Model initialized - weights will be loaded from checkpoint during training")
+
+# Ensure model is in training mode and parameters are unfrozen
+model.train()
+for param in model.parameters():
+    param.requires_grad = True
+
+print(f"Model training mode: {model.training}")
+print(f"All parameters set to requires_grad=True")
 
 model.to(device)
 
@@ -410,13 +488,13 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=1 if device == "mps" else 4,  
     save_steps=1000,
     logging_steps=50,  
-    learning_rate=0.0003,  
+    learning_rate=0.0001,  # Reduced from 0.0003 to 0.0001
     weight_decay=0.01,   
-    max_grad_norm=1.0,
+    max_grad_norm=None,  # Temporarily disable gradient clipping for debugging
     remove_unused_columns=False,
     dataloader_pin_memory=False if device == "mps" else True,  
     dataloader_num_workers=0 if device == "mps" else 2,  
-    max_steps=28360, 
+    max_steps=178360,  # Extended: 28360 + 50000 = 78360 total steps
     save_total_limit=5,  
     warmup_steps=200,  
     lr_scheduler_type="cosine", 
@@ -427,9 +505,31 @@ training_args = TrainingArguments(
 
 # 4. Initialize trainer for continued training
 print("Setting up trainer for continued training...")
+
+# Debug: Check model parameters before trainer initialization
+print("\n=== MODEL PARAMETER DEBUG ===")
+total_params = 0
+trainable_params = 0
+frozen_params = 0
+
+for name, param in model.named_parameters():
+    total_params += param.numel()
+    if param.requires_grad:
+        trainable_params += param.numel()
+    else:
+        frozen_params += param.numel()
+        print(f"FROZEN parameter: {name}")
+
+print(f"Total parameters: {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
+print(f"Frozen parameters: {frozen_params:,}")
+print(f"Model training mode: {model.training}")
+print("=== END DEBUG ===\n")
+
 trainer = MTPTrainer(
     optimizer_type='muonclip',  
-    starting_step=22000,  # Set the step we want to continue from
+    starting_step=78360,  # Start from the latest checkpoint
+    load_optimizer_state=False, 
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset,
@@ -440,12 +540,11 @@ trainer = MTPTrainer(
 print("\n" + "="*60)
 print("--- TRAINING CONTINUATION SETUP ---")
 print(f"Dataset: {dataset_name} (subset of {len(tokenized_dataset)} examples)")
-print(f"Optimizer: MuonClip (Muon with RMS scaling + QK-Clip)")
-print(f"Loaded model weights from: checkpoint-22000")
-print(f"Continuing from step: 22000")
-print(f"Target total steps: 28360 (6360 additional steps)")
 print(f"Learning rate: {training_args.learning_rate}")
 print(f"Batch size: {training_args.per_device_train_batch_size}")
+print(f"Max steps: {training_args.max_steps}")
+print(f"Starting from step: {trainer.starting_step}")
+print(f"Remaining steps: {training_args.max_steps - trainer.starting_step}")
 print(f"Device: {device}")
 print("="*60 + "\n")
 
